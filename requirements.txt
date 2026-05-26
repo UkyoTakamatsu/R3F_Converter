@@ -1,0 +1,7 @@
+numpy
+pandas
+matplotlib
+PyQt6
+pyarrow
+scipy
+python-dotenv

@@ -1,0 +1,15 @@
+# 環境設定（DLL パスなどを含むため Git 管理しない）
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 変換出力
+output/
+*.csv
+*.parquet
+
+# DLL 本体
+*.dll
