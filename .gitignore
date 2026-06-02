@@ -11,5 +11,8 @@ output/
 *.csv
 *.parquet
 
+# サンプルデータ
+samples/
+
 # DLL 本体
 *.dll
