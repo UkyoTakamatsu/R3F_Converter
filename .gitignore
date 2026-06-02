@@ -11,8 +11,9 @@ output/
 *.csv
 *.parquet
 
-# サンプルデータ
-samples/
+# サンプルデータ（ディレクトリは残すが中身は同期しない）
+samples/*
+!samples/.gitkeep
 
 # DLL 本体
 *.dll
