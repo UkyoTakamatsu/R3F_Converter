@@ -12,7 +12,7 @@ from __future__ import annotations
 import ctypes
 import os
 import struct
-from ctypes import c_bool, c_char_p, c_double, c_float, c_int, c_uint, c_wchar_p, POINTER
+from ctypes import c_bool, c_char_p, c_double, c_float, c_int, c_uint, c_uint64, c_wchar_p, POINTER
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -27,6 +27,15 @@ else:
     DLL_DIR = None
 
 ReturnStatus = c_int
+
+
+class IQBLK_ACQINFO(ctypes.Structure):
+    _fields_ = [
+        ("sample0Timestamp",   c_uint64),
+        ("acqStartSample",     c_uint64),
+        ("triggerSampleIndex", c_double),
+        ("acqStatus",          c_uint),
+    ]
 
 
 class RSAError(RuntimeError):
@@ -123,7 +132,15 @@ class PlaybackRSA:
 
         # IQBLK_GetIQData - IQ データ取得
         lib.IQBLK_GetIQData.restype = ReturnStatus
-        lib.IQBLK_GetIQData.argtypes = [POINTER(c_float), POINTER(c_int), POINTER(c_uint)]
+        lib.IQBLK_GetIQData.argtypes = [POINTER(c_float), POINTER(c_int), POINTER(IQBLK_ACQINFO)]
+
+        # DEVICE_Run - デバイス（プレイバック）を開始
+        lib.DEVICE_Run.restype = ReturnStatus
+        lib.DEVICE_Run.argtypes = []
+
+        # DEVICE_Stop - デバイス（プレイバック）を停止
+        lib.DEVICE_Stop.restype = ReturnStatus
+        lib.DEVICE_Stop.argtypes = []
 
         # SYSTEM_GetAPIVersion - API バージョン取得（初期化確認用）
         if hasattr(lib, "SYSTEM_GetAPIVersion"):
@@ -241,9 +258,9 @@ class PlaybackRSA:
         rec_len = self.get_record_length()
         buf = (c_float * (rec_len * 2))()
         actual = c_int(0)
-        iq_info = c_uint(0)
+        acq_info = IQBLK_ACQINFO()
 
-        status = self._lib.IQBLK_GetIQData(buf, ctypes.byref(actual), ctypes.byref(iq_info))
+        status = self._lib.IQBLK_GetIQData(buf, ctypes.byref(actual), ctypes.byref(acq_info))
         if status != 0:
             raise RSAError(f"IQ データ取得失敗 (コード {status})")
 
