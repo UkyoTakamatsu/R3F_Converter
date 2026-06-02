@@ -1,13 +1,18 @@
 """
-RSA_API.dll の ctypes ラッパー。
-実機がない場合は DLL_PATH = None のままにするとダミーモードで動作する。
+Tektronix RSA_API.dll の Playback モード専用ラッパー。
+
+r3f ファイルから IQ データを再生・抽出するのみ。
+デバイス接続は不要。
+
+RSA デバイス固有の DLL（RSA300API.dll, RSA500API.dll など）も読み込み。
 """
 
 from __future__ import annotations
 
 import ctypes
 import os
-from ctypes import c_bool, c_char_p, c_double, c_float, c_int, c_uint, POINTER
+import struct
+from ctypes import c_bool, c_char_p, c_double, c_float, c_int, c_uint, c_wchar_p, POINTER
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,32 +20,64 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 DLL_PATH = os.environ.get("RSA_API_DLL", "RSA_API.dll")
 
-ReturnStatus = c_int
+# DLL が存在するディレクトリを特定
+if Path(DLL_PATH).exists():
+    DLL_DIR = str(Path(DLL_PATH).parent)
+else:
+    DLL_DIR = None
 
-IQBLK_STATUS_INPUT_OVERRANGE = 0x01
-IQBLK_STATUS_DISCONT         = 0x02
+ReturnStatus = c_int
 
 
 class RSAError(RuntimeError):
     pass
 
 
-def _check(status: int, fn_name: str = "") -> None:
-    if status != 0:
-        raise RSAError(f"{fn_name} returned error code {status}")
+class PlaybackRSA:
+    """RSA_API.dll の Playback 専用ラッパー。
 
-
-class RSAAPI:
-    """RSA_API.dll の薄いラッパー。DLL が見つからない場合はダミーモード。"""
+    r3f ファイルから IQ データを再生・抽出するためのシンプルなインターフェース。
+    デバイス接続は不要。RSA デバイス固有の DLL も読み込み。
+    """
 
     def __init__(self, dll_path: str = DLL_PATH) -> None:
-        self._dummy = False
         try:
+            # デバイス固有の DLL を先に読み込む
+            # (RSA300API.dll, RSA500API.dll など)
+            if DLL_DIR:
+                self._load_device_dlls(DLL_DIR)
+
+            # メイン API DLL を読み込む
             self._lib = ctypes.WinDLL(dll_path)
             self._setup_prototypes()
-        except (OSError, AttributeError):
-            print(f"[WARN] {dll_path} が見つかりません。ダミーモードで起動します。")
-            self._dummy = True
+            self._initialized = True
+            print(f"[OK] RSA_API.dll が正常に読み込まれました: {dll_path}")
+        except (OSError, AttributeError) as e:
+            raise RSAError(
+                f"RSA_API.dll が読み込めません: {dll_path}\n"
+                f"詳細: {e}\n"
+                f"Tektronix RSA_API SDK がインストールされているか確認してください。"
+            )
+
+    @staticmethod
+    def _load_device_dlls(dll_dir: str) -> None:
+        """デバイス固有の DLL を読み込む（RSA300API.dll, RSA500API.dll など）。"""
+        device_dlls = [
+            "RSA300API.dll",
+            "RSA500API.dll",
+            "BaseDSPL.dll",
+            "GPMeasDSP.dll",
+            "SharedUtils.dll",
+        ]
+
+        for dll_name in device_dlls:
+            dll_path = Path(dll_dir) / dll_name
+            if dll_path.exists():
+                try:
+                    ctypes.WinDLL(str(dll_path))
+                    print(f"[OK] {dll_name} を読み込みました")
+                except Exception as e:
+                    print(f"[WARN] {dll_name} の読み込みに失敗: {e}")
 
     # ------------------------------------------------------------------
     # プロトタイプ設定
@@ -49,64 +86,55 @@ class RSAAPI:
     def _setup_prototypes(self) -> None:
         lib = self._lib
 
-        # PLAYBACK_OpenDiskFile
-        lib.PLAYBACK_OpenDiskFile.restype  = ReturnStatus
+        # PLAYBACK_OpenDiskFile - r3f ファイルを開く
+        lib.PLAYBACK_OpenDiskFile.restype = ReturnStatus
         lib.PLAYBACK_OpenDiskFile.argtypes = [
-            c_char_p,   # fileName
-            c_double,   # startPercentage
-            c_double,   # stopPercentage
+            c_wchar_p,  # fileName (ワイド文字パス)
+            c_int,      # startPercentage (int 型)
+            c_int,      # stopPercentage (int 型)
             c_double,   # skipTimeBetweenFullAcquisitions
             c_bool,     # loopAtEndOfFile
             c_bool,     # emulateRealTime
         ]
 
-        # DEVICE_Run / DEVICE_Stop
-        lib.DEVICE_Run.restype  = ReturnStatus
-        lib.DEVICE_Run.argtypes = []
-        lib.DEVICE_Stop.restype  = ReturnStatus
-        lib.DEVICE_Stop.argtypes = []
-
-        # CONFIG_GetCenterFreq
-        lib.CONFIG_GetCenterFreq.restype  = ReturnStatus
+        # CONFIG_GetCenterFreq - 中心周波数取得
+        lib.CONFIG_GetCenterFreq.restype = ReturnStatus
         lib.CONFIG_GetCenterFreq.argtypes = [POINTER(c_double)]
 
-        # IQBLK_GetIQSampleRate
-        lib.IQBLK_GetIQSampleRate.restype  = ReturnStatus
+        # IQBLK_GetIQSampleRate - サンプルレート取得
+        lib.IQBLK_GetIQSampleRate.restype = ReturnStatus
         lib.IQBLK_GetIQSampleRate.argtypes = [POINTER(c_double)]
 
-        # IQBLK_SetIQBandwidth
-        lib.IQBLK_SetIQBandwidth.restype  = ReturnStatus
-        lib.IQBLK_SetIQBandwidth.argtypes = [c_double]
-
-        # IQBLK_SetIQRecordLength
-        lib.IQBLK_SetIQRecordLength.restype  = ReturnStatus
+        # IQBLK_SetIQRecordLength - レコード長設定
+        lib.IQBLK_SetIQRecordLength.restype = ReturnStatus
         lib.IQBLK_SetIQRecordLength.argtypes = [c_int]
 
-        # IQBLK_GetIQRecordLength
-        lib.IQBLK_GetIQRecordLength.restype  = ReturnStatus
+        # IQBLK_GetIQRecordLength - レコード長取得
+        lib.IQBLK_GetIQRecordLength.restype = ReturnStatus
         lib.IQBLK_GetIQRecordLength.argtypes = [POINTER(c_int)]
 
-        # IQBLK_AcquireIQData
-        lib.IQBLK_AcquireIQData.restype  = ReturnStatus
+        # IQBLK_AcquireIQData - IQ データ取得開始
+        lib.IQBLK_AcquireIQData.restype = ReturnStatus
         lib.IQBLK_AcquireIQData.argtypes = []
 
-        # IQBLK_WaitForIQDataReady
-        lib.IQBLK_WaitForIQDataReady.restype  = ReturnStatus
+        # IQBLK_WaitForIQDataReady - IQ データ準備完了待機
+        lib.IQBLK_WaitForIQDataReady.restype = ReturnStatus
         lib.IQBLK_WaitForIQDataReady.argtypes = [c_int, POINTER(c_bool)]
 
-        # IQBLK_GetIQData
-        lib.IQBLK_GetIQData.restype  = ReturnStatus
+        # IQBLK_GetIQData - IQ データ取得
+        lib.IQBLK_GetIQData.restype = ReturnStatus
         lib.IQBLK_GetIQData.argtypes = [POINTER(c_float), POINTER(c_int), POINTER(c_uint)]
 
-        # DEVICE_Disconnect
-        lib.DEVICE_Disconnect.restype  = ReturnStatus
-        lib.DEVICE_Disconnect.argtypes = []
+        # SYSTEM_GetAPIVersion - API バージョン取得（初期化確認用）
+        if hasattr(lib, "SYSTEM_GetAPIVersion"):
+            lib.SYSTEM_GetAPIVersion.restype = ReturnStatus
+            lib.SYSTEM_GetAPIVersion.argtypes = [POINTER(c_int), POINTER(c_int), POINTER(c_int)]
 
     # ------------------------------------------------------------------
-    # 公開 API
+    # 公開 API (Playback 専用)
     # ------------------------------------------------------------------
 
-    def open_disk_file(
+    def open_r3f_file(
         self,
         file_path: str,
         start_pct: float = 0.0,
@@ -115,102 +143,149 @@ class RSAAPI:
         loop: bool = False,
         emulate_realtime: bool = False,
     ) -> None:
-        if self._dummy:
-            print(f"[DUMMY] open_disk_file: {file_path}")
-            return
-        _check(
-            self._lib.PLAYBACK_OpenDiskFile(
-                file_path.encode(),
-                c_double(start_pct),
-                c_double(stop_pct),
-                c_double(skip_time),
-                c_bool(loop),
-                c_bool(emulate_realtime),
-            ),
-            "PLAYBACK_OpenDiskFile",
+        """r3f ファイルを開く。
+
+        Args:
+            file_path: .r3f ファイルパス
+            start_pct: 開始位置（%）
+            stop_pct: 終了位置（%）
+            skip_time: スキップ時間
+            loop: ファイル終了時にループするか
+            emulate_realtime: リアルタイム計測をエミュレートするか
+        """
+        # ファイルパスを絶対パスに変換
+        abs_path = str(Path(file_path).resolve())
+
+        if not Path(abs_path).exists():
+            raise RSAError(f"ファイルが見つかりません: {abs_path}")
+
+        print(f"[*] r3f ファイルを開いています: {abs_path}")
+
+        status = self._lib.PLAYBACK_OpenDiskFile(
+            abs_path,  # c_wchar_p は Python str を受け付ける
+            c_int(int(start_pct)),
+            c_int(int(stop_pct)),
+            c_double(skip_time),
+            c_bool(loop),
+            c_bool(emulate_realtime),
         )
 
-    def device_run(self) -> None:
-        if self._dummy:
-            print("[DUMMY] DEVICE_Run")
-            return
-        _check(self._lib.DEVICE_Run(), "DEVICE_Run")
+        if status != 0:
+            error_msgs = {
+                1206: "ファイルを開けません。ファイルの存在確認、アクセス権、ファイルサイズ、またはファイル形式を確認してください。PLAYBACK API が対応していないファイル形式の可能性があります。",
+                1209: "ファイルフォーマットが正しくないか、破損しています。",
+                1210: "ファイルが見つかりません。",
+                1211: "ファイルへのアクセス権がありません。",
+            }
+            msg = error_msgs.get(status, f"不明なエラー (コード {status})")
 
-    def device_stop(self) -> None:
-        if self._dummy:
-            return
-        _check(self._lib.DEVICE_Stop(), "DEVICE_Stop")
+            # 診断情報を追加
+            diag = self.diagnose_r3f_file(abs_path)
+            diag_str = "\n".join(f"  {k}: {v}" for k, v in diag.items())
+
+            raise RSAError(f"r3f ファイルを開けません: {msg}\n診断情報:\n{diag_str}")
+
+        print(f"[OK] ファイルを開きました")
 
     def get_center_freq(self) -> float:
-        if self._dummy:
-            return 1e9
+        """中心周波数を取得 [Hz]。"""
         val = c_double(0.0)
-        _check(self._lib.CONFIG_GetCenterFreq(ctypes.byref(val)), "CONFIG_GetCenterFreq")
+        status = self._lib.CONFIG_GetCenterFreq(ctypes.byref(val))
+        if status != 0:
+            raise RSAError(f"中心周波数取得失敗 (コード {status})")
         return val.value
 
     def get_sample_rate(self) -> float:
-        if self._dummy:
-            return 56e6
+        """サンプルレートを取得 [Hz]。"""
         val = c_double(0.0)
-        _check(self._lib.IQBLK_GetIQSampleRate(ctypes.byref(val)), "IQBLK_GetIQSampleRate")
+        status = self._lib.IQBLK_GetIQSampleRate(ctypes.byref(val))
+        if status != 0:
+            raise RSAError(f"サンプルレート取得失敗 (コード {status})")
         return val.value
 
-    def set_iq_bandwidth(self, bw: float) -> None:
-        if self._dummy:
-            return
-        _check(self._lib.IQBLK_SetIQBandwidth(c_double(bw)), "IQBLK_SetIQBandwidth")
-
     def set_record_length(self, length: int) -> None:
-        if self._dummy:
-            return
-        _check(self._lib.IQBLK_SetIQRecordLength(c_int(length)), "IQBLK_SetIQRecordLength")
+        """1 取得あたりのサンプル数を設定。"""
+        status = self._lib.IQBLK_SetIQRecordLength(c_int(length))
+        if status != 0:
+            raise RSAError(f"レコード長設定失敗 (コード {status})")
 
     def get_record_length(self) -> int:
-        if self._dummy:
-            return 4096
+        """レコード長を取得。"""
         val = c_int(0)
-        _check(self._lib.IQBLK_GetIQRecordLength(ctypes.byref(val)), "IQBLK_GetIQRecordLength")
+        status = self._lib.IQBLK_GetIQRecordLength(ctypes.byref(val))
+        if status != 0:
+            raise RSAError(f"レコード長取得失敗 (コード {status})")
         return val.value
 
     def acquire_iq_data(self, timeout_ms: int = 5000) -> tuple[list[float], list[float]]:
-        """IQ データを取得して (I_list, Q_list) のタプルで返す。"""
-        if self._dummy:
-            import numpy as np
-            n = 4096
-            t = np.linspace(0, n / 56e6, n)
-            noise = np.random.randn(n) * 0.01
-            i_data = (np.cos(2 * np.pi * 1e6 * t) + noise).tolist()
-            q_data = (np.sin(2 * np.pi * 1e6 * t) + noise).tolist()
-            return i_data, q_data
+        """IQ データを取得する。
 
-        _check(self._lib.IQBLK_AcquireIQData(), "IQBLK_AcquireIQData")
+        Returns:
+            (I_data, Q_data) のタプル
+        """
+        # IQ データ取得を開始
+        status = self._lib.IQBLK_AcquireIQData()
+        if status != 0:
+            raise RSAError(f"IQ データ取得開始失敗 (コード {status})")
 
+        # データ準備完了を待機
         ready = c_bool(False)
-        _check(
-            self._lib.IQBLK_WaitForIQDataReady(c_int(timeout_ms), ctypes.byref(ready)),
-            "IQBLK_WaitForIQDataReady",
-        )
-        if not ready.value:
-            raise RSAError("IQ data not ready (timeout)")
+        status = self._lib.IQBLK_WaitForIQDataReady(c_int(timeout_ms), ctypes.byref(ready))
+        if status != 0:
+            raise RSAError(f"IQ データ準備待機失敗 (コード {status})")
 
+        if not ready.value:
+            raise RSAError(f"IQ データがタイムアウト後も準備完了しません ({timeout_ms}ms)")
+
+        # データを取得
         rec_len = self.get_record_length()
         buf = (c_float * (rec_len * 2))()
         actual = c_int(0)
         iq_info = c_uint(0)
-        _check(
-            self._lib.IQBLK_GetIQData(buf, ctypes.byref(actual), ctypes.byref(iq_info)),
-            "IQBLK_GetIQData",
-        )
-        # int16 interleaved I0,Q0,I1,Q1,...
+
+        status = self._lib.IQBLK_GetIQData(buf, ctypes.byref(actual), ctypes.byref(iq_info))
+        if status != 0:
+            raise RSAError(f"IQ データ取得失敗 (コード {status})")
+
+        # int16 interleaved (I0,Q0,I1,Q1,...) を分離
         n = actual.value
-        i_data = [buf[k * 2]     for k in range(n)]
+        i_data = [buf[k * 2] for k in range(n)]
         q_data = [buf[k * 2 + 1] for k in range(n)]
+
         return i_data, q_data
 
-    def disconnect(self) -> None:
-        if self._dummy:
-            return
+    @staticmethod
+    def diagnose_r3f_file(file_path: str) -> dict:
+        """r3f ファイルの構造を診断する（API 呼び出し前）。
+
+        Returns:
+            ファイルフォーマット情報の辞書
+        """
+        abs_path = Path(file_path).resolve()
+        if not abs_path.exists():
+            return {"error": f"ファイルが見つかりません: {abs_path}"}
+
         try:
-            self._lib.DEVICE_Disconnect()
-        except Exception:
-            pass
+            with open(abs_path, "rb") as f:
+                # 最初の 512 バイトを読む
+                header = f.read(512)
+
+                if len(header) < 512:
+                    return {"error": "ファイルサイズが小さすぎます"}
+
+                # 一般的なマジックナンバーをチェック
+                magic = header[:4]
+
+                # R3F ファイルの場合、通常最初の数バイトには識別情報が含まれる
+                # 実際の形式は複数存在するため、簡易的なチェックのみ実施
+                is_text_like = all(32 <= b < 127 for b in header[:100] if b != 0)
+
+                return {
+                    "file_path": str(abs_path),
+                    "file_size": abs_path.stat().st_size,
+                    "magic_bytes": magic.hex(),
+                    "header_sample": header[:64].decode("latin1", errors="replace"),
+                    "appears_binary": not is_text_like,
+                }
+        except Exception as e:
+            return {"error": f"診断失敗: {e}"}

@@ -89,17 +89,14 @@ class AnalysisWorker(QThread):
 
     def run(self) -> None:
         try:
-            from rsa_api import RSAAPI
+            from rsa_api import PlaybackRSA
             from converter import compute_fft, compute_spectrogram
 
-            rsa = RSAAPI()
-            rsa.open_disk_file(self.r3f_path)
-            rsa.device_run()
+            rsa = PlaybackRSA()
+            rsa.open_r3f_file(self.r3f_path)
             rsa.set_record_length(self.record_length)
             sr = rsa.get_sample_rate()
             i_data, q_data = rsa.acquire_iq_data()
-            rsa.device_stop()
-            rsa.disconnect()
 
             freqs, psd    = compute_fft(i_data, q_data, sr)
             f, t, sxx     = compute_spectrogram(i_data, q_data, sr)
@@ -223,14 +220,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "先に R3F ファイルを選択してください。")
             return
         try:
-            from rsa_api import RSAAPI
-            rsa = RSAAPI()
-            rsa.open_disk_file(self._r3f_path)
-            rsa.device_run()
+            from rsa_api import PlaybackRSA
+            rsa = PlaybackRSA()
+            rsa.open_r3f_file(self._r3f_path)
             cf = rsa.get_center_freq()
             sr = rsa.get_sample_rate()
-            rsa.device_stop()
-            rsa.disconnect()
             self._lbl_cf.setText(f"中心周波数: {cf / 1e6:.3f} MHz")
             self._lbl_sr.setText(f"サンプルレート: {sr / 1e6:.3f} MSps")
             self.statusBar().showMessage("メタデータ取得完了")

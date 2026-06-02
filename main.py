@@ -1,6 +1,8 @@
 """
 R3F → CSV 変換アプリ  エントリーポイント
 
+Playback モード専用（デバイス接続不要）。
+
 使い方:
     # GUI モード (デフォルト)
     python main.py
@@ -14,8 +16,7 @@ R3F → CSV 変換アプリ  エントリーポイント
     # メタデータだけ確認
     python main.py --input samples/sample.r3f --meta-only
 
-RSA_API.dll が見つからない場合はダミーモード（サイン波）で動作します。
-DLL の場所を変えるには環境変数 RSA_API_DLL に絶対パスを指定してください。
+DLL の場所を変えるには .env ファイルの RSA_API_DLL を編集してください。
 """
 
 from __future__ import annotations
@@ -26,26 +27,26 @@ from pathlib import Path
 
 
 def cli_main(args: argparse.Namespace) -> int:
-    from rsa_api import RSAAPI
+    from rsa_api import PlaybackRSA
     from converter import (
         convert_r3f_to_csv,
         convert_r3f_to_parquet,
-        iq_to_dataframe,
     )
 
     r3f_path = str(args.input)
 
     if args.meta_only:
-        rsa = RSAAPI()
-        rsa.open_disk_file(r3f_path)
-        rsa.device_run()
-        cf = rsa.get_center_freq()
-        sr = rsa.get_sample_rate()
-        rsa.device_stop()
-        rsa.disconnect()
-        print(f"中心周波数  : {cf / 1e6:.6f} MHz")
-        print(f"サンプルレート: {sr / 1e6:.6f} MSps")
-        return 0
+        try:
+            rsa = PlaybackRSA()
+            rsa.open_r3f_file(r3f_path)
+            cf = rsa.get_center_freq()
+            sr = rsa.get_sample_rate()
+            print(f"中心周波数  : {cf / 1e6:.6f} MHz")
+            print(f"サンプルレート: {sr / 1e6:.6f} MSps")
+            return 0
+        except Exception as e:
+            print(f"エラー: {e}")
+            return 1
 
     out_dir = str(args.output)
 
@@ -54,14 +55,17 @@ def cli_main(args: argparse.Namespace) -> int:
         bar = "#" * (pct // 5)
         print(f"\r[{bar:<20}] {pct:3d}%", end="", flush=True)
 
-    fmt = (args.format or "csv").lower()
-    if fmt == "parquet":
-        out = convert_r3f_to_parquet(r3f_path, out_dir, args.record_length, progress)
-    else:
-        out = convert_r3f_to_csv(r3f_path, out_dir, args.record_length, progress)
-
-    print(f"\n保存完了: {out}")
-    return 0
+    try:
+        fmt = (args.format or "csv").lower()
+        if fmt == "parquet":
+            out = convert_r3f_to_parquet(r3f_path, out_dir, args.record_length, progress)
+        else:
+            out = convert_r3f_to_csv(r3f_path, out_dir, args.record_length, progress)
+        print(f"\n保存完了: {out}")
+        return 0
+    except Exception as e:
+        print(f"\nエラー: {e}")
+        return 1
 
 
 def gui_main() -> int:

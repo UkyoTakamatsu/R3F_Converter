@@ -90,31 +90,22 @@ def convert_r3f_to_csv(
     record_length: int = 65536,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> Path:
-    """r3f ファイルを開き、IQ データを取得して CSV に保存する。"""
-    from rsa_api import RSAAPI
+    """r3f ファイルを CSV に変換。"""
+    from rsa_api import PlaybackRSA
 
-    rsa = RSAAPI()
-    rsa.open_disk_file(r3f_path)
-    rsa.device_run()
+    rsa = PlaybackRSA()
+    rsa.open_r3f_file(r3f_path)
 
     sample_rate = rsa.get_sample_rate()
     rsa.set_record_length(record_length)
 
-    all_i: list[float] = []
-    all_q: list[float] = []
-
-    # 1 ブロック取得（必要に応じてループ拡張可）
+    # IQ データ取得
     i_data, q_data = rsa.acquire_iq_data()
-    all_i.extend(i_data)
-    all_q.extend(q_data)
 
     if progress_cb:
         progress_cb(1, 1)
 
-    rsa.device_stop()
-    rsa.disconnect()
-
-    df = iq_to_dataframe(all_i, all_q, sample_rate)
+    df = iq_to_dataframe(i_data, q_data, sample_rate)
 
     stem = Path(r3f_path).stem
     out_path = Path(out_dir) / f"{stem}.csv"
@@ -127,12 +118,11 @@ def convert_r3f_to_parquet(
     record_length: int = 65536,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> Path:
-    """r3f ファイルを開き、IQ データを取得して Parquet に保存する。"""
-    from rsa_api import RSAAPI
+    """r3f ファイルを Parquet に変換。"""
+    from rsa_api import PlaybackRSA
 
-    rsa = RSAAPI()
-    rsa.open_disk_file(r3f_path)
-    rsa.device_run()
+    rsa = PlaybackRSA()
+    rsa.open_r3f_file(r3f_path)
 
     sample_rate = rsa.get_sample_rate()
     rsa.set_record_length(record_length)
@@ -141,9 +131,6 @@ def convert_r3f_to_parquet(
 
     if progress_cb:
         progress_cb(1, 1)
-
-    rsa.device_stop()
-    rsa.disconnect()
 
     df = iq_to_dataframe(i_data, q_data, sample_rate)
 
