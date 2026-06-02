@@ -50,6 +50,7 @@ class PlaybackRSA:
     """
 
     def __init__(self, dll_path: str = DLL_PATH) -> None:
+        self._record_length: int = 0
         try:
             # デバイス固有の DLL を先に読み込む
             # (RSA300API.dll, RSA500API.dll など)
@@ -176,9 +177,6 @@ class PlaybackRSA:
         if not Path(abs_path).exists():
             raise RSAError(f"ファイルが見つかりません: {abs_path}")
 
-        # DLL は共有シングルトンのため前のセッション状態をリセット
-        self._lib.DEVICE_Stop()
-
         print(f"[*] r3f ファイルを開いています: {abs_path}")
 
         status = self._lib.PLAYBACK_OpenDiskFile(
@@ -235,6 +233,7 @@ class PlaybackRSA:
         status = self._lib.IQBLK_SetIQRecordLength(c_int(length))
         if status != 0:
             raise RSAError(f"レコード長設定失敗 (コード {status})")
+        self._record_length = length
 
     def get_record_length(self) -> int:
         """レコード長を取得。"""
@@ -250,8 +249,10 @@ class PlaybackRSA:
         Returns:
             (I_data, Q_data) のタプル
         """
-        # バッファサイズを取得開始前に確定（WaitForReady 後に呼ぶと ready 状態が壊れる）
-        rec_len = self.get_record_length()
+        # キャッシュ済みの値を使用（IQBLK_GetIQRecordLength は DLL 状態を壊すため呼ばない）
+        if self._record_length == 0:
+            raise RSAError("set_record_length() を先に呼んでください")
+        rec_len = self._record_length
 
         # IQ データ取得を開始
         status = self._lib.IQBLK_AcquireIQData()

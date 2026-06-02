@@ -1,7 +1,7 @@
 """
-PyQt6 GUI モジュール。
+PyQt6 GUI module.
 
-処理フロー:
+Processing flow:
 [Open r3f] -> [Read Metadata] -> [Extract IQ] -> [FFT / Waterfall] -> [Export CSV]
 """
 
@@ -37,7 +37,7 @@ from matplotlib.figure import Figure
 
 
 # ---------------------------------------------------------------------------
-# バックグラウンドワーカー
+# Background workers
 # ---------------------------------------------------------------------------
 
 class ConvertWorker(QThread):
@@ -79,7 +79,7 @@ class ConvertWorker(QThread):
 
 
 class AnalysisWorker(QThread):
-    finished = pyqtSignal(object, object, object, object)
+    finished = pyqtSignal(object, object, object, object, object)
     error    = pyqtSignal(str)
 
     def __init__(self, r3f_path: str, record_length: int) -> None:
@@ -94,26 +94,28 @@ class AnalysisWorker(QThread):
 
             rsa = PlaybackRSA()
             rsa.open_r3f_file(self.r3f_path)
+            cf = rsa.get_center_freq()
             sr = rsa.get_sample_rate()
             rsa.set_record_length(self.record_length)
             i_data, q_data = rsa.acquire_iq_data()
+            rsa.close()
 
-            freqs, psd    = compute_fft(i_data, q_data, sr)
-            f, t, sxx     = compute_spectrogram(i_data, q_data, sr)
+            freqs, psd = compute_fft(i_data, q_data, sr)
+            f, t, sxx  = compute_spectrogram(i_data, q_data, sr)
 
-            self.finished.emit(freqs, psd, (f, t, sxx), sr)
+            self.finished.emit(freqs, psd, (f, t, sxx), sr, cf)
         except Exception as exc:
             self.error.emit(str(exc))
 
 
 # ---------------------------------------------------------------------------
-# メインウィンドウ
+# Main window
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("R3F → CSV 変換ツール")
+        self.setWindowTitle("R3F Converter")
         self.setMinimumSize(900, 700)
 
         self._r3f_path: str | None = None
@@ -126,23 +128,23 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
 
-        # ---- ファイル選択 ----
-        file_group = QGroupBox("1. R3F ファイルを開く")
+        # ---- File selection ----
+        file_group = QGroupBox("1. Open R3F File")
         fl = QHBoxLayout(file_group)
-        self._file_label = QLabel("(未選択)")
+        self._file_label = QLabel("(No file selected)")
         self._file_label.setWordWrap(True)
-        btn_open = QPushButton("参照…")
+        btn_open = QPushButton("Browse...")
         btn_open.clicked.connect(self._on_open_file)
         fl.addWidget(self._file_label, stretch=1)
         fl.addWidget(btn_open)
         root.addWidget(file_group)
 
-        # ---- メタデータ ----
-        meta_group = QGroupBox("2. メタデータ")
+        # ---- Metadata ----
+        meta_group = QGroupBox("2. Metadata")
         ml = QHBoxLayout(meta_group)
-        self._lbl_cf = QLabel("中心周波数: -")
-        self._lbl_sr = QLabel("サンプルレート: -")
-        btn_meta = QPushButton("取得")
+        self._lbl_cf = QLabel("Center Freq: -")
+        self._lbl_sr = QLabel("Sample Rate: -")
+        btn_meta = QPushButton("Read")
         btn_meta.clicked.connect(self._on_read_metadata)
         ml.addWidget(self._lbl_cf)
         ml.addWidget(self._lbl_sr)
@@ -150,43 +152,43 @@ class MainWindow(QMainWindow):
         ml.addWidget(btn_meta)
         root.addWidget(meta_group)
 
-        # ---- 変換設定 ----
-        conv_group = QGroupBox("3. 変換設定 / エクスポート")
+        # ---- Export settings ----
+        conv_group = QGroupBox("3. Export Settings")
         cl = QHBoxLayout(conv_group)
 
-        cl.addWidget(QLabel("形式:"))
+        cl.addWidget(QLabel("Format:"))
         self._fmt_combo = QComboBox()
         self._fmt_combo.addItems(["CSV", "Parquet"])
         cl.addWidget(self._fmt_combo)
 
-        cl.addWidget(QLabel("レコード長:"))
+        cl.addWidget(QLabel("Record Length:"))
         self._rec_spin = QSpinBox()
         self._rec_spin.setRange(256, 1 << 20)
         self._rec_spin.setValue(65536)
         self._rec_spin.setSingleStep(1024)
         cl.addWidget(self._rec_spin)
 
-        btn_outdir = QPushButton("出力先…")
+        btn_outdir = QPushButton("Output Dir...")
         btn_outdir.clicked.connect(self._on_choose_outdir)
         self._outdir_label = QLabel(str(Path("output").resolve()))
         cl.addWidget(btn_outdir)
         cl.addWidget(self._outdir_label, stretch=1)
 
-        btn_export = QPushButton("エクスポート")
+        btn_export = QPushButton("Export")
         btn_export.clicked.connect(self._on_export)
         cl.addWidget(btn_export)
         root.addWidget(conv_group)
 
-        # ---- プログレス ----
+        # ---- Progress ----
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
         root.addWidget(self._progress)
 
-        # ---- 分析 ----
-        plot_group = QGroupBox("4. 分析 (FFT / Waterfall)")
+        # ---- Analysis ----
+        plot_group = QGroupBox("4. Analysis (FFT / Waterfall)")
         pl = QVBoxLayout(plot_group)
 
-        btn_analyze = QPushButton("IQ を取得して解析")
+        btn_analyze = QPushButton("Acquire IQ & Analyze")
         btn_analyze.clicked.connect(self._on_analyze)
         pl.addWidget(btn_analyze)
 
@@ -198,26 +200,26 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
 
     # ------------------------------------------------------------------
-    # イベントハンドラ
+    # Event handlers
     # ------------------------------------------------------------------
 
     def _on_open_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "R3F ファイルを選択", "", "R3F Files (*.r3f);;All Files (*)"
+            self, "Select R3F File", "", "R3F Files (*.r3f);;All Files (*)"
         )
         if path:
             self._r3f_path = path
             self._file_label.setText(path)
-            self.statusBar().showMessage(f"開きました: {path}")
+            self.statusBar().showMessage(f"Opened: {path}")
 
     def _on_choose_outdir(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "出力フォルダを選択", "output")
+        d = QFileDialog.getExistingDirectory(self, "Select Output Directory", "output")
         if d:
             self._outdir_label.setText(d)
 
     def _on_read_metadata(self) -> None:
         if not self._r3f_path:
-            QMessageBox.warning(self, "警告", "先に R3F ファイルを選択してください。")
+            QMessageBox.warning(self, "Warning", "Please select an R3F file first.")
             return
         try:
             from rsa_api import PlaybackRSA
@@ -226,15 +228,15 @@ class MainWindow(QMainWindow):
             cf = rsa.get_center_freq()
             sr = rsa.get_sample_rate()
             rsa.close()
-            self._lbl_cf.setText(f"中心周波数: {cf / 1e6:.3f} MHz")
-            self._lbl_sr.setText(f"サンプルレート: {sr / 1e6:.3f} MSps")
-            self.statusBar().showMessage("メタデータ取得完了")
+            self._lbl_cf.setText(f"Center Freq: {cf / 1e6:.3f} MHz")
+            self._lbl_sr.setText(f"Sample Rate: {sr / 1e6:.3f} MSps")
+            self.statusBar().showMessage("Metadata loaded.")
         except Exception as exc:
-            QMessageBox.critical(self, "エラー", str(exc))
+            QMessageBox.critical(self, "Error", str(exc))
 
     def _on_export(self) -> None:
         if not self._r3f_path:
-            QMessageBox.warning(self, "警告", "先に R3F ファイルを選択してください。")
+            QMessageBox.warning(self, "Warning", "Please select an R3F file first.")
             return
         if self._worker and self._worker.isRunning():
             return
@@ -250,27 +252,27 @@ class MainWindow(QMainWindow):
             lambda d, t: self._progress.setValue(int(d / t * 100))
         )
         self._worker.finished.connect(self._on_export_done)
-        self._worker.error.connect(lambda e: QMessageBox.critical(self, "エラー", e))
+        self._worker.error.connect(lambda e: QMessageBox.critical(self, "Error", e))
         self._worker.start()
-        self.statusBar().showMessage("変換中…")
+        self.statusBar().showMessage("Converting...")
 
     def _on_export_done(self, out_path: str) -> None:
         self._progress.setValue(100)
-        self.statusBar().showMessage(f"保存完了: {out_path}")
-        QMessageBox.information(self, "完了", f"保存しました:\n{out_path}")
+        self.statusBar().showMessage(f"Saved: {out_path}")
+        QMessageBox.information(self, "Done", f"File saved:\n{out_path}")
 
     def _on_analyze(self) -> None:
         if not self._r3f_path:
-            QMessageBox.warning(self, "警告", "先に R3F ファイルを選択してください。")
+            QMessageBox.warning(self, "Warning", "Please select an R3F file first.")
             return
         if self._worker and self._worker.isRunning():
             return
 
         self._worker = AnalysisWorker(self._r3f_path, self._rec_spin.value())
         self._worker.finished.connect(self._on_analysis_done)
-        self._worker.error.connect(lambda e: QMessageBox.critical(self, "エラー", e))
+        self._worker.error.connect(lambda e: QMessageBox.critical(self, "Error", e))
         self._worker.start()
-        self.statusBar().showMessage("解析中…")
+        self.statusBar().showMessage("Analyzing...")
 
     def _on_analysis_done(
         self,
@@ -278,30 +280,51 @@ class MainWindow(QMainWindow):
         psd: np.ndarray,
         spectrogram_data: tuple,
         sample_rate: float,
+        center_freq: float,
     ) -> None:
         f, t, sxx = spectrogram_data
-        self._figure.clear()
+        cf_mhz = center_freq / 1e6
+        sr_mhz = sample_rate / 1e6
 
+        # Baseband -> absolute RF frequency [MHz]
+        rf_freqs = (center_freq + freqs) / 1e6
+        rf_f     = (center_freq + f)    / 1e6
+
+        self._figure.clear()
+        self._figure.suptitle(
+            f"Center Freq: {cf_mhz:.3f} MHz   Sample Rate: {sr_mhz:.1f} MSps",
+            fontsize=10,
+        )
+
+        # ---- FFT Spectrum ----
         ax1 = self._figure.add_subplot(1, 2, 1)
-        ax1.plot(freqs / 1e6, psd, linewidth=0.5)
-        ax1.set_xlabel("周波数 [MHz]")
-        ax1.set_ylabel("電力 [dBFS]")
-        ax1.set_title("FFT スペクトル")
+        ax1.plot(rf_freqs, psd, linewidth=0.5, color="steelblue")
+        ax1.axvline(cf_mhz, color="red", linewidth=0.8, linestyle="--", label=f"CF {cf_mhz:.1f} MHz")
+        ax1.set_xlabel("Frequency [MHz]")
+        ax1.set_ylabel("Amplitude Spectrum [dBFS]")
+        ax1.set_title("FFT Spectrum")
+        ax1.legend(fontsize=8)
         ax1.grid(True, alpha=0.3)
 
+        # ---- Waterfall (Spectrogram) ----
         ax2 = self._figure.add_subplot(1, 2, 2)
-        ax2.pcolormesh(t * 1e3, f / 1e6, sxx, shading="auto", cmap="inferno")
-        ax2.set_xlabel("時間 [ms]")
-        ax2.set_ylabel("周波数 [MHz]")
-        ax2.set_title("ウォーターフォール")
+        mesh = ax2.pcolormesh(t * 1e3, rf_f, sxx, shading="auto", cmap="inferno")
+        ax2.axhline(cf_mhz, color="cyan", linewidth=0.8, linestyle="--", label=f"CF {cf_mhz:.1f} MHz")
+        self._figure.colorbar(mesh, ax=ax2, label="Power [dB]", fraction=0.046, pad=0.04)
+        ax2.set_xlabel("Time [ms]")
+        ax2.set_ylabel("Frequency [MHz]")
+        ax2.set_title("Waterfall (Spectrogram)")
+        ax2.legend(fontsize=8)
 
         self._figure.tight_layout()
         self._canvas.draw()
-        self.statusBar().showMessage(f"解析完了 (SR={sample_rate / 1e6:.1f} MSps)")
+        self.statusBar().showMessage(
+            f"Analysis done — CF: {cf_mhz:.3f} MHz  SR: {sr_mhz:.1f} MSps"
+        )
 
 
 # ---------------------------------------------------------------------------
-# エントリーポイント
+# Entry point
 # ---------------------------------------------------------------------------
 
 def run_gui() -> None:
