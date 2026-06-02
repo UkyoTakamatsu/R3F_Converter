@@ -94,8 +94,8 @@ class AnalysisWorker(QThread):
 
             rsa = PlaybackRSA()
             rsa.open_r3f_file(self.r3f_path)
-            rsa.set_record_length(self.record_length)
             sr = rsa.get_sample_rate()
+            rsa.set_record_length(self.record_length)
             i_data, q_data = rsa.acquire_iq_data()
 
             freqs, psd    = compute_fft(i_data, q_data, sr)
@@ -225,6 +225,7 @@ class MainWindow(QMainWindow):
             rsa.open_r3f_file(self._r3f_path)
             cf = rsa.get_center_freq()
             sr = rsa.get_sample_rate()
+            rsa.close()
             self._lbl_cf.setText(f"中心周波数: {cf / 1e6:.3f} MHz")
             self._lbl_sr.setText(f"サンプルレート: {sr / 1e6:.3f} MSps")
             self.statusBar().showMessage("メタデータ取得完了")

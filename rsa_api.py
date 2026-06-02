@@ -176,6 +176,9 @@ class PlaybackRSA:
         if not Path(abs_path).exists():
             raise RSAError(f"ファイルが見つかりません: {abs_path}")
 
+        # DLL は共有シングルトンのため前のセッション状態をリセット
+        self._lib.DEVICE_Stop()
+
         print(f"[*] r3f ファイルを開いています: {abs_path}")
 
         status = self._lib.PLAYBACK_OpenDiskFile(
@@ -203,6 +206,13 @@ class PlaybackRSA:
             raise RSAError(f"r3f ファイルを開けません: {msg}\n診断情報:\n{diag_str}")
 
         print(f"[OK] ファイルを開きました")
+
+    def close(self) -> None:
+        """DLL セッションを閉じて状態をリセットする。
+        メタデータのみ取得するケースで必ず呼ぶこと。
+        呼ばずに次の IQBLK 操作を行うと IQBLK_GetIQData が 302 を返す。
+        """
+        self._lib.DEVICE_Stop()
 
     def get_center_freq(self) -> float:
         """中心周波数を取得 [Hz]。"""
@@ -240,6 +250,9 @@ class PlaybackRSA:
         Returns:
             (I_data, Q_data) のタプル
         """
+        # バッファサイズを取得開始前に確定（WaitForReady 後に呼ぶと ready 状態が壊れる）
+        rec_len = self.get_record_length()
+
         # IQ データ取得を開始
         status = self._lib.IQBLK_AcquireIQData()
         if status != 0:
@@ -255,7 +268,6 @@ class PlaybackRSA:
             raise RSAError(f"IQ データがタイムアウト後も準備完了しません ({timeout_ms}ms)")
 
         # データを取得
-        rec_len = self.get_record_length()
         buf = (c_float * (rec_len * 2))()
         actual = c_int(0)
         acq_info = IQBLK_ACQINFO()
