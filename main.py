@@ -1,7 +1,9 @@
 """
 R3F → CSV 変換アプリ  エントリーポイント
 
-Playback モード専用（デバイス接続不要）。
+Playback モード専用（デバイス接続不要）。DPX を使用してスペクトラム・
+スペクトログラムデータを取得し frequency_hz / time_s / amplitude_dbm の
+3 列 CSV / Parquet に変換します。
 
 使い方:
     # GUI モード (デフォルト)
@@ -51,6 +53,8 @@ def cli_main(args: argparse.Namespace) -> int:
     out_dir = str(args.output)
 
     def progress(done: int, total: int) -> None:
+        if total == 0:
+            return
         pct = int(done / total * 100)
         bar = "#" * (pct // 5)
         print(f"\r[{bar:<20}] {pct:3d}%", end="", flush=True)
@@ -58,9 +62,9 @@ def cli_main(args: argparse.Namespace) -> int:
     try:
         fmt = (args.format or "csv").lower()
         if fmt == "parquet":
-            out = convert_r3f_to_parquet(r3f_path, out_dir, args.record_length, progress)
+            out = convert_r3f_to_parquet(r3f_path, out_dir, progress_cb=progress)
         else:
-            out = convert_r3f_to_csv(r3f_path, out_dir, args.record_length, progress)
+            out = convert_r3f_to_csv(r3f_path, out_dir, progress_cb=progress)
         print(f"\n保存完了: {out}")
         return 0
     except Exception as e:
@@ -79,11 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="r3f-converter",
         description="Tektronix RSA .r3f ファイルを CSV / Parquet に変換するツール",
     )
-    p.add_argument("--input",         "-i", type=Path, help=".r3f ファイルパス (省略時は GUI 起動)")
-    p.add_argument("--output",        "-o", type=Path, default=Path("output"), help="出力ディレクトリ (default: output)")
-    p.add_argument("--format",        "-f", choices=["csv", "parquet"], default="csv", help="出力形式 (default: csv)")
-    p.add_argument("--record-length", "-r", type=int, default=65536, help="1 取得あたりのサンプル数 (default: 65536)")
-    p.add_argument("--meta-only",     "-m", action="store_true", help="メタデータだけ表示して終了")
+    p.add_argument("--input",    "-i", type=Path, help=".r3f ファイルパス (省略時は GUI 起動)")
+    p.add_argument("--output",   "-o", type=Path, default=Path("output"), help="出力ディレクトリ (default: output)")
+    p.add_argument("--format",   "-f", choices=["csv", "parquet"], default="csv", help="出力形式 (default: csv)")
+    p.add_argument("--meta-only","-m", action="store_true", help="メタデータだけ表示して終了")
     return p
 
 

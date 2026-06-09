@@ -2,14 +2,13 @@
 PyQt6 GUI module.
 
 Processing flow:
-[Open r3f] -> [Read Metadata] -> [Extract IQ] -> [FFT / Waterfall] -> [Export CSV]
+[Open r3f] -> [Read Metadata] -> [DPX Acquire] -> [Spectrum / Waterfall in dBm] -> [Export CSV]
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -24,7 +23,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QSpinBox,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -35,28 +33,25 @@ matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-
 # ---------------------------------------------------------------------------
 # Background workers
 # ---------------------------------------------------------------------------
 
 class ConvertWorker(QThread):
-    progress   = pyqtSignal(int, int)
-    finished   = pyqtSignal(str)
-    error      = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(str)
+    error    = pyqtSignal(str)
 
     def __init__(
         self,
         r3f_path: str,
         out_dir: str,
         fmt: str,
-        record_length: int,
     ) -> None:
         super().__init__()
-        self.r3f_path     = r3f_path
-        self.out_dir      = out_dir
-        self.fmt          = fmt
-        self.record_length = record_length
+        self.r3f_path = r3f_path
+        self.out_dir  = out_dir
+        self.fmt      = fmt
 
     def run(self) -> None:
         try:
@@ -66,44 +61,62 @@ class ConvertWorker(QThread):
                 self.progress.emit(done, total)
 
             if self.fmt == "CSV":
-                out = convert_r3f_to_csv(
-                    self.r3f_path, self.out_dir, self.record_length, cb
-                )
+                out = convert_r3f_to_csv(self.r3f_path, self.out_dir, progress_cb=cb)
             else:
-                out = convert_r3f_to_parquet(
-                    self.r3f_path, self.out_dir, self.record_length, cb
-                )
+                out = convert_r3f_to_parquet(self.r3f_path, self.out_dir, progress_cb=cb)
             self.finished.emit(str(out))
         except Exception as exc:
             self.error.emit(str(exc))
 
 
 class AnalysisWorker(QThread):
+    """DPX hi-res ラインからスペクトラム・スペクトログラムを生成する。
+
+    finished シグナルの引数:
+        freqs_hz   : ndarray  — 絶対 RF 周波数 [Hz]
+        psd_dbm    : ndarray  — スペクトラム [dBm]（全ラインの平均）
+        sog_data   : tuple(f, t, sxx)  — f [Hz], t [s], sxx [dBm] (freq×time)
+        sample_rate: float [Hz]
+        center_freq: float [Hz]
+    """
     finished = pyqtSignal(object, object, object, object, object)
     error    = pyqtSignal(str)
 
-    def __init__(self, r3f_path: str, record_length: int) -> None:
+    def __init__(self, r3f_path: str) -> None:
         super().__init__()
-        self.r3f_path     = r3f_path
-        self.record_length = record_length
+        self.r3f_path = r3f_path
 
     def run(self) -> None:
         try:
             from rsa_api import PlaybackRSA
-            from converter import compute_fft, compute_spectrogram
 
             rsa = PlaybackRSA()
             rsa.open_r3f_file(self.r3f_path)
             cf = rsa.get_center_freq()
             sr = rsa.get_sample_rate()
-            rsa.set_record_length(self.record_length)
-            i_data, q_data = rsa.acquire_iq_data()
+
+            fspan = min(sr, 40e6)
+            dpx_data = rsa.acquire_dpx_data(fspan)
+            trace_len = dpx_data["trace_length"]
+            hires = rsa.get_dpx_hires_lines(trace_len)
             rsa.close()
 
-            freqs, psd = compute_fft(i_data, q_data, sr)
-            f, t, sxx  = compute_spectrogram(i_data, q_data, sr)
+            if not hires:
+                self.error.emit("DPX hi-res ラインが取得できませんでした。")
+                return
 
-            self.finished.emit(freqs, psd, (f, t, sxx), sr, cf)
+            n_freq = len(hires[0][0])
+            freqs = np.linspace(cf - fspan / 2, cf + fspan / 2, n_freq)
+
+            power_matrix = np.array([pwr for pwr, _ in hires], dtype=np.float64)  # (n_time, n_freq)
+            psd_dbm = np.mean(power_matrix, axis=0)  # 全ライン平均スペクトラム
+
+            timestamps = np.array([ts for _, ts in hires])
+            timestamps = timestamps - timestamps[0]    # 表示用に 0 正規化
+
+            sxx = power_matrix.T  # (n_freq, n_time)
+
+            self.finished.emit(freqs, psd_dbm, (freqs, timestamps, sxx), sr, cf)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -116,7 +129,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("R3F Converter")
-        self.setMinimumSize(900, 700)
+        self.setMinimumSize(960, 720)
 
         self._r3f_path: str | None = None
         self._worker: QThread | None = None
@@ -161,13 +174,6 @@ class MainWindow(QMainWindow):
         self._fmt_combo.addItems(["CSV", "Parquet"])
         cl.addWidget(self._fmt_combo)
 
-        cl.addWidget(QLabel("Record Length:"))
-        self._rec_spin = QSpinBox()
-        self._rec_spin.setRange(256, 1 << 20)
-        self._rec_spin.setValue(65536)
-        self._rec_spin.setSingleStep(1024)
-        cl.addWidget(self._rec_spin)
-
         btn_outdir = QPushButton("Output Dir...")
         btn_outdir.clicked.connect(self._on_choose_outdir)
         self._outdir_label = QLabel(str(Path("output").resolve()))
@@ -185,14 +191,14 @@ class MainWindow(QMainWindow):
         root.addWidget(self._progress)
 
         # ---- Analysis ----
-        plot_group = QGroupBox("4. Analysis (FFT / Waterfall)")
+        plot_group = QGroupBox("4. DPX Analysis (Spectrum / Waterfall)")
         pl = QVBoxLayout(plot_group)
 
-        btn_analyze = QPushButton("Acquire IQ & Analyze")
+        btn_analyze = QPushButton("Acquire DPX & Analyze")
         btn_analyze.clicked.connect(self._on_analyze)
         pl.addWidget(btn_analyze)
 
-        self._figure = Figure(figsize=(8, 4))
+        self._figure = Figure(figsize=(9, 4.5))
         self._canvas = FigureCanvas(self._figure)
         pl.addWidget(self._canvas)
         root.addWidget(plot_group, stretch=1)
@@ -246,15 +252,14 @@ class MainWindow(QMainWindow):
             self._r3f_path,
             self._outdir_label.text(),
             self._fmt_combo.currentText(),
-            self._rec_spin.value(),
         )
         self._worker.progress.connect(
-            lambda d, t: self._progress.setValue(int(d / t * 100))
+            lambda d, t: self._progress.setValue(int(d / t * 100) if t else 0)
         )
         self._worker.finished.connect(self._on_export_done)
         self._worker.error.connect(lambda e: QMessageBox.critical(self, "Error", e))
         self._worker.start()
-        self.statusBar().showMessage("Converting...")
+        self.statusBar().showMessage("Converting (DPX)...")
 
     def _on_export_done(self, out_path: str) -> None:
         self._progress.setValue(100)
@@ -268,16 +273,16 @@ class MainWindow(QMainWindow):
         if self._worker and self._worker.isRunning():
             return
 
-        self._worker = AnalysisWorker(self._r3f_path, self._rec_spin.value())
+        self._worker = AnalysisWorker(self._r3f_path)
         self._worker.finished.connect(self._on_analysis_done)
         self._worker.error.connect(lambda e: QMessageBox.critical(self, "Error", e))
         self._worker.start()
-        self.statusBar().showMessage("Analyzing...")
+        self.statusBar().showMessage("DPX acquisition in progress...")
 
     def _on_analysis_done(
         self,
         freqs: np.ndarray,
-        psd: np.ndarray,
+        psd_dbm: np.ndarray,
         spectrogram_data: tuple,
         sample_rate: float,
         center_freq: float,
@@ -286,31 +291,58 @@ class MainWindow(QMainWindow):
         cf_mhz = center_freq / 1e6
         sr_mhz = sample_rate / 1e6
 
-        # Baseband -> absolute RF frequency [MHz]
-        rf_freqs = (center_freq + freqs) / 1e6
-        rf_f     = (center_freq + f)    / 1e6
+        rf_freqs_mhz = freqs / 1e6
+        rf_f_mhz     = f / 1e6
 
         self._figure.clear()
         self._figure.suptitle(
-            f"Center Freq: {cf_mhz:.3f} MHz   Sample Rate: {sr_mhz:.1f} MSps",
+            f"Center Freq: {cf_mhz:.3f} MHz   Sample Rate: {sr_mhz:.1f} MSps   [DPX]",
             fontsize=10,
         )
 
-        # ---- FFT Spectrum ----
+        # ---- DPX Spectrum (dBm) ----
         ax1 = self._figure.add_subplot(1, 2, 1)
-        ax1.plot(rf_freqs, psd, linewidth=0.5, color="steelblue")
-        ax1.axvline(cf_mhz, color="red", linewidth=0.8, linestyle="--", label=f"CF {cf_mhz:.1f} MHz")
+        ax1.plot(rf_freqs_mhz, psd_dbm, linewidth=0.8, color="steelblue")
+        ax1.fill_between(
+            rf_freqs_mhz, psd_dbm.min() - 5, psd_dbm,
+            alpha=0.2, color="steelblue",
+        )
+
+        # 尾根（ピーク）を検出してマーク（失敗しても続行）
+        try:
+            from scipy.signal import find_peaks
+            peaks, props = find_peaks(
+                psd_dbm,
+                prominence=6,
+                distance=max(1, len(psd_dbm) // 80),
+            )
+            if len(peaks) > 0:
+                top_n = min(5, len(peaks))
+                top_peaks = peaks[np.argsort(props["prominences"])[-top_n:]]
+                ax1.scatter(
+                    rf_freqs_mhz[top_peaks], psd_dbm[top_peaks],
+                    color="red", s=30, zorder=5, marker="^",
+                    label=f"Peaks ({top_n})",
+                )
+        except Exception:
+            pass
+
+        ax1.axvline(cf_mhz, color="red", linewidth=0.8, linestyle="--",
+                    label=f"CF {cf_mhz:.1f} MHz")
         ax1.set_xlabel("Frequency [MHz]")
-        ax1.set_ylabel("Amplitude Spectrum [dBFS]")
-        ax1.set_title("FFT Spectrum")
+        ax1.set_ylabel("Power [dBm]")
+        ax1.set_title("DPX Spectrum")
         ax1.legend(fontsize=8)
         ax1.grid(True, alpha=0.3)
 
-        # ---- Waterfall (Spectrogram) ----
+        # ---- Waterfall (dBm) ----
         ax2 = self._figure.add_subplot(1, 2, 2)
-        mesh = ax2.pcolormesh(t * 1e3, rf_f, sxx, shading="auto", cmap="inferno")
-        ax2.axhline(cf_mhz, color="cyan", linewidth=0.8, linestyle="--", label=f"CF {cf_mhz:.1f} MHz")
-        self._figure.colorbar(mesh, ax=ax2, label="Power [dB]", fraction=0.046, pad=0.04)
+        if sxx.ndim == 2 and sxx.shape[1] > 1:
+            mesh = ax2.pcolormesh(t * 1e3, rf_f_mhz, sxx, shading="auto", cmap="inferno")
+            self._figure.colorbar(mesh, ax=ax2, label="Power [dB]",
+                                  fraction=0.046, pad=0.04)
+        ax2.axhline(cf_mhz, color="cyan", linewidth=0.8, linestyle="--",
+                    label=f"CF {cf_mhz:.1f} MHz")
         ax2.set_xlabel("Time [ms]")
         ax2.set_ylabel("Frequency [MHz]")
         ax2.set_title("Waterfall (Spectrogram)")
@@ -319,7 +351,7 @@ class MainWindow(QMainWindow):
         self._figure.tight_layout()
         self._canvas.draw()
         self.statusBar().showMessage(
-            f"Analysis done — CF: {cf_mhz:.3f} MHz  SR: {sr_mhz:.1f} MSps"
+            f"DPX analysis done — CF: {cf_mhz:.3f} MHz  SR: {sr_mhz:.1f} MSps"
         )
 
 

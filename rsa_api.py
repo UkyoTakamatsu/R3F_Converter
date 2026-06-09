@@ -1,7 +1,7 @@
 """
 Tektronix RSA_API.dll の Playback モード専用ラッパー。
 
-r3f ファイルから IQ データを再生・抽出するのみ。
+r3f ファイルから DPX / IQ データを再生・抽出するのみ。
 デバイス接続は不要。
 
 RSA デバイス固有の DLL（RSA300API.dll, RSA500API.dll など）も読み込み。
@@ -12,7 +12,11 @@ from __future__ import annotations
 import ctypes
 import os
 import struct
-from ctypes import c_bool, c_char_p, c_double, c_float, c_int, c_uint, c_uint64, c_wchar_p, POINTER
+from ctypes import (
+    c_bool, c_char_p, c_double, c_float, c_int, c_uint, c_uint64, c_wchar_p,
+    POINTER,
+    c_int16, c_int32, c_int64, c_uint8, c_uint32,
+)
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -38,6 +42,40 @@ class IQBLK_ACQINFO(ctypes.Structure):
     ]
 
 
+class DPX_FrameBuffer(ctypes.Structure):
+    """DPX フレームバッファ構造体（API Programmer Manual Table 1 準拠）。
+
+    spectrumTraces は float** で trace 0 = 平均、1 = Max、2 = Min。
+    各トレース要素の単位は Watts。
+    sogramBitmap は 0-254 のスケール値（最新行が先頭）。
+    """
+    _fields_ = [
+        ("fftPerFrame",                        c_int32),
+        ("fftCount",                           c_int64),
+        ("frameCount",                         c_int64),
+        ("timestamp",                          c_double),
+        ("acqDataStatus",                      c_uint32),
+        ("minSigDuration",                     c_double),
+        ("minSigDurOutOfRange",                c_bool),
+        ("spectrumBitmapWidth",                c_int32),
+        ("spectrumBitmapHeight",               c_int32),
+        ("spectrumBitmapSize",                 c_int32),
+        ("spectrumTraceLength",                c_int32),
+        ("numSpectrumTraces",                  c_int32),
+        ("spectrumEnabled",                    c_bool),
+        ("spectrogramEnabled",                 c_bool),
+        ("spectrumBitmap",                     POINTER(c_float)),
+        ("spectrumTraces",                     POINTER(POINTER(c_float))),
+        ("sogramBitmapWidth",                  c_int32),
+        ("sogramBitmapHeight",                 c_int32),
+        ("sogramBitmapSize",                   c_int32),
+        ("sogramBitmapNumValidLines",          c_int32),
+        ("sogramBitmap",                       POINTER(c_uint8)),
+        ("sogramBitmapTimestampArray",         POINTER(c_double)),
+        ("sogramBitmapContainTriggerArray",    POINTER(c_int16)),
+    ]
+
+
 class RSAError(RuntimeError):
     pass
 
@@ -45,19 +83,16 @@ class RSAError(RuntimeError):
 class PlaybackRSA:
     """RSA_API.dll の Playback 専用ラッパー。
 
-    r3f ファイルから IQ データを再生・抽出するためのシンプルなインターフェース。
+    r3f ファイルから DPX / IQ データを再生・抽出するためのシンプルなインターフェース。
     デバイス接続は不要。RSA デバイス固有の DLL も読み込み。
     """
 
     def __init__(self, dll_path: str = DLL_PATH) -> None:
         self._record_length: int = 0
         try:
-            # デバイス固有の DLL を先に読み込む
-            # (RSA300API.dll, RSA500API.dll など)
             if DLL_DIR:
                 self._load_device_dlls(DLL_DIR)
 
-            # メイン API DLL を読み込む
             self._lib = ctypes.WinDLL(dll_path)
             self._setup_prototypes()
             self._initialized = True
@@ -96,60 +131,132 @@ class PlaybackRSA:
     def _setup_prototypes(self) -> None:
         lib = self._lib
 
-        # PLAYBACK_OpenDiskFile - r3f ファイルを開く
+        # PLAYBACK_OpenDiskFile
         lib.PLAYBACK_OpenDiskFile.restype = ReturnStatus
         lib.PLAYBACK_OpenDiskFile.argtypes = [
-            c_wchar_p,  # fileName (ワイド文字パス)
-            c_int,      # startPercentage (int 型)
-            c_int,      # stopPercentage (int 型)
-            c_double,   # skipTimeBetweenFullAcquisitions
-            c_bool,     # loopAtEndOfFile
-            c_bool,     # emulateRealTime
+            c_wchar_p, c_int, c_int, c_double, c_bool, c_bool,
         ]
 
-        # CONFIG_GetCenterFreq - 中心周波数取得
+        # CONFIG_GetCenterFreq
         lib.CONFIG_GetCenterFreq.restype = ReturnStatus
         lib.CONFIG_GetCenterFreq.argtypes = [POINTER(c_double)]
 
-        # IQBLK_GetIQSampleRate - サンプルレート取得
+        # CONFIG_GetReferenceLevel
+        lib.CONFIG_GetReferenceLevel.restype = ReturnStatus
+        lib.CONFIG_GetReferenceLevel.argtypes = [POINTER(c_double)]
+
+        # IQBLK_GetIQSampleRate
         lib.IQBLK_GetIQSampleRate.restype = ReturnStatus
         lib.IQBLK_GetIQSampleRate.argtypes = [POINTER(c_double)]
 
-        # IQBLK_SetIQRecordLength - レコード長設定
+        # IQBLK_SetIQRecordLength
         lib.IQBLK_SetIQRecordLength.restype = ReturnStatus
         lib.IQBLK_SetIQRecordLength.argtypes = [c_int]
 
-        # IQBLK_GetIQRecordLength - レコード長取得
+        # IQBLK_GetIQRecordLength
         lib.IQBLK_GetIQRecordLength.restype = ReturnStatus
         lib.IQBLK_GetIQRecordLength.argtypes = [POINTER(c_int)]
 
-        # IQBLK_AcquireIQData - IQ データ取得開始
+        # IQBLK_AcquireIQData
         lib.IQBLK_AcquireIQData.restype = ReturnStatus
         lib.IQBLK_AcquireIQData.argtypes = []
 
-        # IQBLK_WaitForIQDataReady - IQ データ準備完了待機
+        # IQBLK_WaitForIQDataReady
         lib.IQBLK_WaitForIQDataReady.restype = ReturnStatus
         lib.IQBLK_WaitForIQDataReady.argtypes = [c_int, POINTER(c_bool)]
 
-        # IQBLK_GetIQData - IQ データ取得
+        # IQBLK_GetIQData
         lib.IQBLK_GetIQData.restype = ReturnStatus
         lib.IQBLK_GetIQData.argtypes = [POINTER(c_float), POINTER(c_int), POINTER(IQBLK_ACQINFO)]
 
-        # DEVICE_Run - デバイス（プレイバック）を開始
+        # DEVICE_Run
         lib.DEVICE_Run.restype = ReturnStatus
         lib.DEVICE_Run.argtypes = []
 
-        # DEVICE_Stop - デバイス（プレイバック）を停止
+        # DEVICE_Stop
         lib.DEVICE_Stop.restype = ReturnStatus
         lib.DEVICE_Stop.argtypes = []
 
-        # SYSTEM_GetAPIVersion - API バージョン取得（初期化確認用）
+        # SYSTEM_GetAPIVersion
         if hasattr(lib, "SYSTEM_GetAPIVersion"):
             lib.SYSTEM_GetAPIVersion.restype = ReturnStatus
             lib.SYSTEM_GetAPIVersion.argtypes = [POINTER(c_int), POINTER(c_int), POINTER(c_int)]
 
+        # --- DPX 関数 ---
+
+        # DPX_SetParameters
+        lib.DPX_SetParameters.restype = ReturnStatus
+        lib.DPX_SetParameters.argtypes = [
+            c_double,   # fspan
+            c_double,   # rbw
+            c_int32,    # bitmapWidth
+            c_int32,    # tracePtsPerPixel (1/3/5)
+            c_int,      # yUnit (0=dBm, 1=Watt, ...)
+            c_double,   # yTop
+            c_double,   # yBottom
+            c_bool,     # infinitePersistence
+            c_double,   # persistenceTimeSec
+            c_bool,     # showOnlyTrigFrame
+        ]
+
+        # DPX_SetSogramParameters
+        lib.DPX_SetSogramParameters.restype = ReturnStatus
+        lib.DPX_SetSogramParameters.argtypes = [
+            c_double,   # timePerBitmapLine (s)
+            c_double,   # timeResolution (s, >= 1 ms)
+            c_double,   # maxPower (dBm)
+            c_double,   # minPower (dBm)
+        ]
+
+        # DPX_Configure
+        lib.DPX_Configure.restype = ReturnStatus
+        lib.DPX_Configure.argtypes = [c_bool, c_bool]
+
+        # DPX_SetEnable
+        lib.DPX_SetEnable.restype = ReturnStatus
+        lib.DPX_SetEnable.argtypes = [c_bool]
+
+        # DPX_WaitForDataReady
+        lib.DPX_WaitForDataReady.restype = ReturnStatus
+        lib.DPX_WaitForDataReady.argtypes = [c_int, POINTER(c_bool)]
+
+        # DPX_GetFrameBuffer
+        lib.DPX_GetFrameBuffer.restype = ReturnStatus
+        lib.DPX_GetFrameBuffer.argtypes = [POINTER(DPX_FrameBuffer)]
+
+        # DPX_FinishFrameBuffer
+        lib.DPX_FinishFrameBuffer.restype = ReturnStatus
+        lib.DPX_FinishFrameBuffer.argtypes = []
+
+        # DPX_Reset
+        lib.DPX_Reset.restype = ReturnStatus
+        lib.DPX_Reset.argtypes = []
+
+        # DPX_GetRBWRange
+        lib.DPX_GetRBWRange.restype = ReturnStatus
+        lib.DPX_GetRBWRange.argtypes = [c_double, POINTER(c_double), POINTER(c_double)]
+
+        # DPX_GetSogramHiResLineCountLatest
+        lib.DPX_GetSogramHiResLineCountLatest.restype = ReturnStatus
+        lib.DPX_GetSogramHiResLineCountLatest.argtypes = [POINTER(c_int32)]
+
+        # DPX_GetSogramHiResLine
+        lib.DPX_GetSogramHiResLine.restype = ReturnStatus
+        lib.DPX_GetSogramHiResLine.argtypes = [
+            POINTER(c_int16),   # vData
+            POINTER(c_int32),   # vDataSize
+            c_int32,            # lineIndex
+            POINTER(c_double),  # dataSF
+            c_int32,            # tracePoints
+            c_int32,            # firstValidPoint
+        ]
+
+        # DPX_GetSogramHiResLineTimestamp
+        lib.DPX_GetSogramHiResLineTimestamp.restype = ReturnStatus
+        lib.DPX_GetSogramHiResLineTimestamp.argtypes = [POINTER(c_double), c_int32]
+
     # ------------------------------------------------------------------
-    # 公開 API (Playback 専用)
+    # 公開 API (Playback 専用) — IQ
     # ------------------------------------------------------------------
 
     def open_r3f_file(
@@ -161,17 +268,7 @@ class PlaybackRSA:
         loop: bool = False,
         emulate_realtime: bool = False,
     ) -> None:
-        """r3f ファイルを開く。
-
-        Args:
-            file_path: .r3f ファイルパス
-            start_pct: 開始位置（%）
-            stop_pct: 終了位置（%）
-            skip_time: スキップ時間
-            loop: ファイル終了時にループするか
-            emulate_realtime: リアルタイム計測をエミュレートするか
-        """
-        # ファイルパスを絶対パスに変換
+        """r3f ファイルを開く。"""
         abs_path = str(Path(file_path).resolve())
 
         if not Path(abs_path).exists():
@@ -180,7 +277,7 @@ class PlaybackRSA:
         print(f"[*] r3f ファイルを開いています: {abs_path}")
 
         status = self._lib.PLAYBACK_OpenDiskFile(
-            abs_path,  # c_wchar_p は Python str を受け付ける
+            abs_path,
             c_int(int(start_pct)),
             c_int(int(stop_pct)),
             c_double(skip_time),
@@ -190,26 +287,20 @@ class PlaybackRSA:
 
         if status != 0:
             error_msgs = {
-                1206: "ファイルを開けません。ファイルの存在確認、アクセス権、ファイルサイズ、またはファイル形式を確認してください。PLAYBACK API が対応していないファイル形式の可能性があります。",
+                1206: "ファイルを開けません。ファイルの存在確認、アクセス権、ファイルサイズ、またはファイル形式を確認してください。",
                 1209: "ファイルフォーマットが正しくないか、破損しています。",
                 1210: "ファイルが見つかりません。",
                 1211: "ファイルへのアクセス権がありません。",
             }
             msg = error_msgs.get(status, f"不明なエラー (コード {status})")
-
-            # 診断情報を追加
             diag = self.diagnose_r3f_file(abs_path)
             diag_str = "\n".join(f"  {k}: {v}" for k, v in diag.items())
-
             raise RSAError(f"r3f ファイルを開けません: {msg}\n診断情報:\n{diag_str}")
 
         print(f"[OK] ファイルを開きました")
 
     def close(self) -> None:
-        """DLL セッションを閉じて状態をリセットする。
-        メタデータのみ取得するケースで必ず呼ぶこと。
-        呼ばずに次の IQBLK 操作を行うと IQBLK_GetIQData が 302 を返す。
-        """
+        """DLL セッションを閉じて状態をリセットする。"""
         self._lib.DEVICE_Stop()
 
     def get_center_freq(self) -> float:
@@ -218,6 +309,14 @@ class PlaybackRSA:
         status = self._lib.CONFIG_GetCenterFreq(ctypes.byref(val))
         if status != 0:
             raise RSAError(f"中心周波数取得失敗 (コード {status})")
+        return val.value
+
+    def get_reference_level(self) -> float:
+        """基準レベルを取得 [dBm]。失敗時は 0.0 を返す。"""
+        val = c_double(0.0)
+        status = self._lib.CONFIG_GetReferenceLevel(ctypes.byref(val))
+        if status != 0:
+            return 0.0
         return val.value
 
     def get_sample_rate(self) -> float:
@@ -244,22 +343,15 @@ class PlaybackRSA:
         return val.value
 
     def acquire_iq_data(self, timeout_ms: int = 5000) -> tuple[list[float], list[float]]:
-        """IQ データを取得する。
-
-        Returns:
-            (I_data, Q_data) のタプル
-        """
-        # キャッシュ済みの値を使用（IQBLK_GetIQRecordLength は DLL 状態を壊すため呼ばない）
+        """IQ データを取得する。"""
         if self._record_length == 0:
             raise RSAError("set_record_length() を先に呼んでください")
         rec_len = self._record_length
 
-        # IQ データ取得を開始
         status = self._lib.IQBLK_AcquireIQData()
         if status != 0:
             raise RSAError(f"IQ データ取得開始失敗 (コード {status})")
 
-        # データ準備完了を待機
         ready = c_bool(False)
         status = self._lib.IQBLK_WaitForIQDataReady(c_int(timeout_ms), ctypes.byref(ready))
         if status != 0:
@@ -268,7 +360,6 @@ class PlaybackRSA:
         if not ready.value:
             raise RSAError(f"IQ データがタイムアウト後も準備完了しません ({timeout_ms}ms)")
 
-        # データを取得
         buf = (c_float * (rec_len * 2))()
         actual = c_int(0)
         acq_info = IQBLK_ACQINFO()
@@ -277,43 +368,175 @@ class PlaybackRSA:
         if status != 0:
             raise RSAError(f"IQ データ取得失敗 (コード {status})")
 
-        # int16 interleaved (I0,Q0,I1,Q1,...) を分離
         n = actual.value
         i_data = [buf[k * 2] for k in range(n)]
         q_data = [buf[k * 2 + 1] for k in range(n)]
 
         return i_data, q_data
 
-    @staticmethod
-    def diagnose_r3f_file(file_path: str) -> dict:
-        """r3f ファイルの構造を診断する（API 呼び出し前）。
+    # ------------------------------------------------------------------
+    # 公開 API (Playback 専用) — DPX
+    # ------------------------------------------------------------------
+
+    def acquire_dpx_data(
+        self,
+        fspan: float,
+        rbw: float | None = None,
+        y_top: float = 0.0,
+        y_bottom: float = -120.0,
+        trace_length: int = 801,
+        time_per_bitmap_line: float = 0.1,
+        time_resolution: float = 0.01,
+        timeout_ms: int = 10000,
+    ) -> dict:
+        """DPX を設定・実行してセッション情報を返す。
+
+        DPX_GetFrameBuffer（ポインタフィールドを持つ構造体）は呼ばない。
+        実データは get_dpx_hires_lines() で取得する。
 
         Returns:
-            ファイルフォーマット情報の辞書
+            dict with keys: trace_length, fspan, y_top, y_bottom
         """
+        # RBW 範囲を取得
+        min_rbw = c_double(0.0)
+        max_rbw = c_double(0.0)
+        self._lib.DPX_GetRBWRange(c_double(fspan), ctypes.byref(min_rbw), ctypes.byref(max_rbw))
+
+        if rbw is None:
+            lo = min_rbw.value if min_rbw.value > 0 else 1.0
+            hi = max_rbw.value if max_rbw.value > 0 else fspan
+            rbw = max(lo, min(hi, fspan / 200.0))
+
+        # DPX_SetParameters (VerticalUnit_dBm = 0)
+        status = self._lib.DPX_SetParameters(
+            c_double(fspan),
+            c_double(rbw),
+            c_int32(trace_length),
+            c_int32(1),
+            c_int(0),
+            c_double(y_top),
+            c_double(y_bottom),
+            c_bool(False),
+            c_double(1.0),
+            c_bool(False),
+        )
+        if status != 0:
+            raise RSAError(f"DPX_SetParameters 失敗 (コード {status})")
+
+        # DPX_SetSogramParameters
+        t_res = max(time_resolution, 0.001)
+        status = self._lib.DPX_SetSogramParameters(
+            c_double(time_per_bitmap_line),
+            c_double(t_res),
+            c_double(y_top),
+            c_double(y_bottom),
+        )
+        if status != 0:
+            raise RSAError(f"DPX_SetSogramParameters 失敗 (コード {status})")
+
+        # DPX_Configure → DPX_SetEnable → DEVICE_Run
+        status = self._lib.DPX_Configure(c_bool(True), c_bool(True))
+        if status != 0:
+            raise RSAError(f"DPX_Configure 失敗 (コード {status})")
+
+        status = self._lib.DPX_SetEnable(c_bool(True))
+        if status != 0:
+            raise RSAError(f"DPX_SetEnable 失敗 (コード {status})")
+
+        status = self._lib.DEVICE_Run()
+        if status != 0:
+            raise RSAError(f"DEVICE_Run 失敗 (コード {status})")
+
+        # DPX_WaitForDataReady
+        ready = c_bool(False)
+        status = self._lib.DPX_WaitForDataReady(c_int(timeout_ms), ctypes.byref(ready))
+        if status != 0:
+            self._lib.DEVICE_Stop()
+            raise RSAError(f"DPX_WaitForDataReady 失敗 (コード {status})")
+        if not ready.value:
+            self._lib.DEVICE_Stop()
+            raise RSAError(f"DPX データが準備できませんでした ({timeout_ms}ms タイムアウト)")
+
+        # DPX_FinishFrameBuffer でフレームを解放（GetFrameBuffer は呼ばない）
+        self._lib.DPX_FinishFrameBuffer()
+        self._lib.DEVICE_Stop()
+
+        return {
+            "trace_length": trace_length,
+            "fspan":        fspan,
+            "y_top":        y_top,
+            "y_bottom":     y_bottom,
+        }
+
+    def get_dpx_hires_lines(
+        self,
+        trace_points: int,
+    ) -> list[tuple[list[float], float]]:
+        """DPX スペクトログラム高分解能ラインを全取得する。
+
+        DEVICE_Stop() 後に呼ぶこと。
+        Returns: [(power_dbm_list, timestamp), ...]  — 時系列順（古い順）
+        """
+        count_c = c_int32(0)
+        status = self._lib.DPX_GetSogramHiResLineCountLatest(ctypes.byref(count_c))
+        if status != 0:
+            return []
+
+        count = count_c.value
+        if count == 0:
+            return []
+
+        result = []
+        for i in range(count):
+            vdata = (c_int16 * trace_points)()
+            vdata_size = c_int32(0)
+            data_sf = c_double(0.0)
+
+            status = self._lib.DPX_GetSogramHiResLine(
+                vdata,
+                ctypes.byref(vdata_size),
+                c_int32(i),
+                ctypes.byref(data_sf),
+                c_int32(trace_points),
+                c_int32(0),
+            )
+            if status != 0:
+                continue
+
+            ts = c_double(0.0)
+            self._lib.DPX_GetSogramHiResLineTimestamp(ctypes.byref(ts), c_int32(i))
+
+            n = vdata_size.value
+            sf = data_sf.value
+            power_dbm = [float(vdata[j]) * sf for j in range(n)]
+            result.append((power_dbm, float(ts.value)))
+
+        # API は最新行が index 0 なので時系列順（古い順）に反転
+        result.reverse()
+        return result
+
+    # ------------------------------------------------------------------
+    # 診断
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def diagnose_r3f_file(file_path: str) -> dict:
+        """r3f ファイルの構造を診断する（API 呼び出し前）。"""
         abs_path = Path(file_path).resolve()
         if not abs_path.exists():
             return {"error": f"ファイルが見つかりません: {abs_path}"}
 
         try:
             with open(abs_path, "rb") as f:
-                # 最初の 512 バイトを読む
                 header = f.read(512)
-
                 if len(header) < 512:
                     return {"error": "ファイルサイズが小さすぎます"}
-
-                # 一般的なマジックナンバーをチェック
                 magic = header[:4]
-
-                # R3F ファイルの場合、通常最初の数バイトには識別情報が含まれる
-                # 実際の形式は複数存在するため、簡易的なチェックのみ実施
                 is_text_like = all(32 <= b < 127 for b in header[:100] if b != 0)
-
                 return {
-                    "file_path": str(abs_path),
-                    "file_size": abs_path.stat().st_size,
-                    "magic_bytes": magic.hex(),
+                    "file_path":     str(abs_path),
+                    "file_size":     abs_path.stat().st_size,
+                    "magic_bytes":   magic.hex(),
                     "header_sample": header[:64].decode("latin1", errors="replace"),
                     "appears_binary": not is_text_like,
                 }
