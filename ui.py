@@ -109,7 +109,7 @@ class AnalysisWorker(QThread):
             freqs = np.linspace(cf - fspan / 2, cf + fspan / 2, n_freq)
 
             power_matrix = np.array([pwr for pwr, _ in hires], dtype=np.float64)  # (n_time, n_freq)
-            psd_dbm = np.mean(power_matrix, axis=0)  # 全ライン平均スペクトラム
+            psd_dbm = np.max(power_matrix, axis=0)  # 各周波数ごとの最大電力を抜粋
 
             timestamps = np.array([ts for _, ts in hires])
             timestamps = timestamps - timestamps[0]    # 表示用に 0 正規化
