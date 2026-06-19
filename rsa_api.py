@@ -137,6 +137,10 @@ class PlaybackRSA:
             c_wchar_p, c_int, c_int, c_double, c_bool, c_bool,
         ]
 
+        # PLAYBACK_GetReplayComplete
+        lib.PLAYBACK_GetReplayComplete.restype = ReturnStatus
+        lib.PLAYBACK_GetReplayComplete.argtypes = [POINTER(c_bool)]
+
         # CONFIG_GetCenterFreq
         lib.CONFIG_GetCenterFreq.restype = ReturnStatus
         lib.CONFIG_GetCenterFreq.argtypes = [POINTER(c_double)]
@@ -391,11 +395,15 @@ class PlaybackRSA:
     ) -> dict:
         """DPX を設定・実行してセッション情報を返す。
 
-        DPX_GetFrameBuffer（ポインタフィールドを持つ構造体）は呼ばない。
-        実データは get_dpx_hires_lines() で取得する。
+        マニュアル（API Programmer Manual, DPX_Configure の手順）に従い、
+        再生がファイル終端に達するまで
+        WaitForDataReady → GetFrameBuffer → FinishFrameBuffer を繰り返す。
+        これにより r3f 全期間分の高分解能スペクトログラムラインが
+        内部バッファに蓄積され、停止後に get_dpx_hires_lines() で全取得できる。
+        （1 フレームのみ処理すると HiRes ラインが数本しか得られず途切れる。）
 
         Returns:
-            dict with keys: trace_length, fspan, y_top, y_bottom
+            dict with keys: trace_length, fspan, y_top, y_bottom, frame_count
         """
         # RBW 範囲を取得
         min_rbw = c_double(0.0)
@@ -447,18 +455,44 @@ class PlaybackRSA:
         if status != 0:
             raise RSAError(f"DEVICE_Run 失敗 (コード {status})")
 
-        # DPX_WaitForDataReady
-        ready = c_bool(False)
-        status = self._lib.DPX_WaitForDataReady(c_int(timeout_ms), ctypes.byref(ready))
-        if status != 0:
-            self._lib.DEVICE_Stop()
-            raise RSAError(f"DPX_WaitForDataReady 失敗 (コード {status})")
-        if not ready.value:
+        # 再生終端までフレームを取得し続ける。
+        # 1 フレームしか処理しないと HiRes ラインが数本しか溜まらず
+        # 出力が途中で途切れるため、ここでファイル全体を消費する。
+        fb = DPX_FrameBuffer()
+        complete = c_bool(False)
+        frame_count = 0
+        empty_waits = 0
+        max_empty_waits = 3  # 終端でもないのにフレームが来ない場合の安全弁
+
+        while True:
+            # 先に終端状態を確認（最後の長いタイムアウト待ちを避ける）
+            self._lib.PLAYBACK_GetReplayComplete(ctypes.byref(complete))
+
+            ready = c_bool(False)
+            status = self._lib.DPX_WaitForDataReady(c_int(timeout_ms), ctypes.byref(ready))
+            if status != 0:
+                self._lib.DEVICE_Stop()
+                raise RSAError(f"DPX_WaitForDataReady 失敗 (コード {status})")
+
+            if ready.value:
+                # GetFrameBuffer → FinishFrameBuffer でフレームを送り、
+                # HiRes スペクトログラムバッファに 1 フレーム分を蓄積する。
+                if self._lib.DPX_GetFrameBuffer(ctypes.byref(fb)) == 0:
+                    frame_count += 1
+                self._lib.DPX_FinishFrameBuffer()
+                empty_waits = 0
+            else:
+                # フレームが来ない。終端に達していれば（残フレームも無いので）終了。
+                if complete.value:
+                    break
+                empty_waits += 1
+                if empty_waits >= max_empty_waits:
+                    break
+
+        if frame_count == 0:
             self._lib.DEVICE_Stop()
             raise RSAError(f"DPX データが準備できませんでした ({timeout_ms}ms タイムアウト)")
 
-        # DPX_FinishFrameBuffer でフレームを解放（GetFrameBuffer は呼ばない）
-        self._lib.DPX_FinishFrameBuffer()
         self._lib.DEVICE_Stop()
 
         return {
@@ -466,6 +500,7 @@ class PlaybackRSA:
             "fspan":        fspan,
             "y_top":        y_top,
             "y_bottom":     y_bottom,
+            "frame_count":  frame_count,
         }
 
     def get_dpx_hires_lines(
