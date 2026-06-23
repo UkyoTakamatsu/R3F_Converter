@@ -15,20 +15,43 @@ import struct
 from ctypes import (
     c_bool, c_char_p, c_double, c_float, c_int, c_uint, c_uint64, c_wchar_p,
     POINTER,
-    c_int16, c_int32, c_int64, c_uint8, c_uint32,
+    c_int16, c_int32, c_int64, c_uint8, c_uint32, c_longlong,
 )
 from pathlib import Path
 
+import sys
+
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent / ".env")
-DLL_PATH = os.environ.get("RSA_API_DLL", "RSA_API.dll")
+from config import app_dir
 
-# DLL が存在するディレクトリを特定
-if Path(DLL_PATH).exists():
-    DLL_DIR = str(Path(DLL_PATH).parent)
+load_dotenv(app_dir() / ".env")
+
+
+def _bundled_dll_dir() -> Path | None:
+    """PyInstaller で同梱された RSA_API.dll のあるディレクトリ。
+
+    frozen かつ RSA_API.dll が同梱されていれば、その場所を返す。
+    それ以外（通常実行や DLL 非同梱ビルド）は None。
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        if (base / "RSA_API.dll").exists():
+            return base
+    return None
+
+
+_bundled = _bundled_dll_dir()
+IS_BUNDLED = _bundled is not None
+
+if _bundled is not None:
+    # 同梱版: バンドル内の DLL を使用（.env 不要）
+    DLL_PATH = str(_bundled / "RSA_API.dll")
+    DLL_DIR  = str(_bundled)
 else:
-    DLL_DIR = None
+    # 外部 DLL 方式: .env の RSA_API_DLL を使用
+    DLL_PATH = os.environ.get("RSA_API_DLL", "RSA_API.dll")
+    DLL_DIR  = str(Path(DLL_PATH).parent) if Path(DLL_PATH).exists() else None
 
 ReturnStatus = c_int
 
@@ -181,6 +204,11 @@ class PlaybackRSA:
         lib.DEVICE_Stop.restype = ReturnStatus
         lib.DEVICE_Stop.argtypes = []
 
+        # DEVICE_Disconnect
+        if hasattr(lib, "DEVICE_Disconnect"):
+            lib.DEVICE_Disconnect.restype = ReturnStatus
+            lib.DEVICE_Disconnect.argtypes = []
+
         # SYSTEM_GetAPIVersion
         if hasattr(lib, "SYSTEM_GetAPIVersion"):
             lib.SYSTEM_GetAPIVersion.restype = ReturnStatus
@@ -259,6 +287,18 @@ class PlaybackRSA:
         lib.DPX_GetSogramHiResLineTimestamp.restype = ReturnStatus
         lib.DPX_GetSogramHiResLineTimestamp.argtypes = [POINTER(c_double), c_int32]
 
+        # REFTIME_GetTimeFromTimestamp — タイムスタンプ(tick)を実時刻(整数秒)へ変換
+        lib.REFTIME_GetTimeFromTimestamp.restype = ReturnStatus
+        lib.REFTIME_GetTimeFromTimestamp.argtypes = [
+            c_uint64,           # timestamp (tick)
+            POINTER(c_longlong),  # o_timeSec (Unix 秒)
+            POINTER(c_double),    # o_timeNsec (本 DLL では未充填)
+        ]
+
+        # REFTIME_GetTimestampRate — タイムスタンプの tick レート [tick/s]
+        lib.REFTIME_GetTimestampRate.restype = ReturnStatus
+        lib.REFTIME_GetTimestampRate.argtypes = [POINTER(c_uint64)]
+
     # ------------------------------------------------------------------
     # 公開 API (Playback 専用) — IQ
     # ------------------------------------------------------------------
@@ -304,8 +344,22 @@ class PlaybackRSA:
         print(f"[OK] ファイルを開きました")
 
     def close(self) -> None:
-        """DLL セッションを閉じて状態をリセットする。"""
-        self._lib.DEVICE_Stop()
+        """DLL セッションを閉じて状態をリセットする。
+
+        RSA_API.dll はプロセス内でグローバルに 1 つの再生セッションしか持たない。
+        DEVICE_Stop() だけでは再生セッションが解放されず、次回 PLAYBACK_OpenDiskFile()
+        を呼ぶと DLL 内部で不正アクセスが起きてプロセスごとクラッシュする。
+        DEVICE_Disconnect() でセッションを完全に解放し、再オープン可能な状態に戻す。
+        """
+        try:
+            self._lib.DEVICE_Stop()
+        except Exception:
+            pass
+        if hasattr(self._lib, "DEVICE_Disconnect"):
+            try:
+                self._lib.DEVICE_Disconnect()
+            except Exception:
+                pass
 
     def get_center_freq(self) -> float:
         """中心周波数を取得 [Hz]。"""
@@ -511,6 +565,7 @@ class PlaybackRSA:
 
         DEVICE_Stop() 後に呼ぶこと。
         Returns: [(power_dbm_list, timestamp), ...]  — 時系列順（古い順）
+                 timestamp は Unix エポック秒（小数部含む）。
         """
         count_c = c_int32(0)
         status = self._lib.DPX_GetSogramHiResLineCountLatest(ctypes.byref(count_c))
@@ -521,7 +576,14 @@ class PlaybackRSA:
         if count == 0:
             return []
 
-        result = []
+        # tick レート [tick/s] を取得（小数秒分解能の算出に使う）
+        rate_c = c_uint64(0)
+        rate = 0.0
+        if self._lib.REFTIME_GetTimestampRate(ctypes.byref(rate_c)) == 0:
+            rate = float(rate_c.value)
+
+        # 各ラインの (電力配列, 生 tick) を収集
+        raw = []
         for i in range(count):
             vdata = (c_int16 * trace_points)()
             vdata_size = c_int32(0)
@@ -544,10 +606,34 @@ class PlaybackRSA:
             n = vdata_size.value
             sf = data_sf.value
             power_dbm = [float(vdata[j]) * sf for j in range(n)]
-            result.append((power_dbm, float(ts.value)))
+            raw.append((power_dbm, float(ts.value)))
 
-        # API は最新行が index 0 なので時系列順（古い順）に反転
-        result.reverse()
+        if not raw:
+            return []
+
+        # tick を Unix エポック秒へ変換する。
+        # REFTIME_GetTimeFromTimestamp は整数秒しか返さないため、基準となる 1 本の
+        # 実時刻(整数秒)に対し tick レートで小数秒分解能を付与する:
+        #   unix(tick) = base_sec + (tick - base_tick) / rate
+        base_tick = raw[0][1]
+        base_sec = base_tick
+        t_sec = c_longlong(0)
+        t_nsec = c_double(0.0)
+        if self._lib.REFTIME_GetTimeFromTimestamp(
+            c_uint64(int(base_tick)), ctypes.byref(t_sec), ctypes.byref(t_nsec)
+        ) == 0:
+            base_sec = float(t_sec.value)
+
+        result = []
+        for power_dbm, tick in raw:
+            if rate > 0:
+                unix_sec = base_sec + (tick - base_tick) / rate
+            else:
+                unix_sec = tick
+            result.append((power_dbm, unix_sec))
+
+        # タイムスタンプ昇順（古い順）に整列する
+        result.sort(key=lambda x: x[1])
         return result
 
     # ------------------------------------------------------------------

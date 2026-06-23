@@ -168,6 +168,49 @@ def dpx_to_dataframe(
         })
 
 
+def dpx_freq_max_dataframe(
+    hires_lines: list[tuple[list[float], float]],
+    center_freq: float,
+    fspan: float,
+) -> pd.DataFrame:
+    """各周波数ビンの全時間にわたる最大電力の表を生成。
+
+    列: frequency_hz, max_amplitude_dbm
+    """
+    if not hires_lines:
+        return pd.DataFrame({"frequency_hz": [], "max_amplitude_dbm": []})
+
+    n_freq = len(hires_lines[0][0])
+    freqs = np.linspace(center_freq - fspan / 2, center_freq + fspan / 2, n_freq)
+    power = np.array([pwr for pwr, _ in hires_lines], dtype=np.float64)  # (n_time, n_freq)
+    max_dbm = np.max(power, axis=0)
+    return pd.DataFrame({
+        "frequency_hz":      freqs,
+        "max_amplitude_dbm": max_dbm,
+    })
+
+
+def dpx_time_max_dataframe(
+    hires_lines: list[tuple[list[float], float]],
+) -> pd.DataFrame:
+    """各時間ライン（タイムスタンプ）の全周波数にわたる最大電力の表を生成。
+
+    列: time_s, max_amplitude_dbm
+    """
+    if not hires_lines:
+        return pd.DataFrame({"time_s": [], "max_amplitude_dbm": []})
+
+    times = np.array([ts for _, ts in hires_lines], dtype=np.float64)
+    if len(times) > 0:
+        times = times - times.min()   # 測定開始を 0 に正規化
+    power = np.array([pwr for pwr, _ in hires_lines], dtype=np.float64)  # (n_time, n_freq)
+    max_dbm = np.max(power, axis=1)
+    return pd.DataFrame({
+        "time_s":            times,
+        "max_amplitude_dbm": max_dbm,
+    })
+
+
 def save_csv(df: pd.DataFrame, out_path: str | Path) -> Path:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,50 +229,99 @@ def save_parquet(df: pd.DataFrame, out_path: str | Path) -> Path:
 # r3f → CSV / Parquet 変換 (DPX ベース)
 # ---------------------------------------------------------------------------
 
+# 出力内容の種類
+CONTENT_RAW      = "raw"        # 生 DPX データ (frequency_hz, timestamp, amplitude_dbm)
+CONTENT_FREQ_MAX = "freq_max"   # 各周波数ごとの最大値 (frequency_hz, max_amplitude_dbm)
+CONTENT_TIME_MAX = "time_max"   # 各時間ごとの最大値   (time_s, max_amplitude_dbm)
+
+# 内容種別ごとのファイル名サフィックス
+_CONTENT_SUFFIX = {
+    CONTENT_RAW:      "_dpx",
+    CONTENT_FREQ_MAX: "_freq_max",
+    CONTENT_TIME_MAX: "_time_max",
+}
+
+
+def _build_dataframe(
+    content: str,
+    dpx_data: dict,
+    cf: float,
+    fspan: float,
+    hires: list[tuple[list[float], float]],
+) -> pd.DataFrame:
+    """内容種別に応じた DataFrame を生成する。"""
+    if content == CONTENT_FREQ_MAX:
+        return dpx_freq_max_dataframe(hires, cf, fspan)
+    if content == CONTENT_TIME_MAX:
+        return dpx_time_max_dataframe(hires)
+    # デフォルト: 生 DPX データ
+    return dpx_to_dataframe(dpx_data, cf, hires_lines=hires if hires else None)
+
+
+def convert_r3f(
+    r3f_path: str,
+    out_dir: str = "output",
+    fmt: str = "csv",
+    content: str = CONTENT_RAW,
+    fspan: float | None = None,
+    progress_cb: Callable[[int, int], None] | None = None,
+) -> Path:
+    """r3f ファイルを DPX 経由で CSV / Parquet に変換。
+
+    Args:
+        fmt     : "csv" | "parquet"
+        content : CONTENT_RAW | CONTENT_FREQ_MAX | CONTENT_TIME_MAX
+    """
+    from rsa_api import PlaybackRSA
+
+    fmt = (fmt or "csv").lower()
+    rsa = PlaybackRSA()
+    try:
+        rsa.open_r3f_file(r3f_path)
+        cf = rsa.get_center_freq()
+        sr = rsa.get_sample_rate()
+
+        if fspan is None:
+            fspan = min(sr, 40e6)
+
+        if progress_cb:
+            progress_cb(0, 3)
+
+        dpx_data = rsa.acquire_dpx_data(fspan)
+        trace_len = dpx_data["trace_length"]
+
+        if progress_cb:
+            progress_cb(1, 3)
+
+        hires = rsa.get_dpx_hires_lines(trace_len)
+
+        if progress_cb:
+            progress_cb(2, 3)
+
+        df = _build_dataframe(content, dpx_data, cf, fspan, hires)
+
+        stem = Path(r3f_path).stem
+        suffix = _CONTENT_SUFFIX.get(content, "")
+        ext = "parquet" if fmt == "parquet" else "csv"
+        out_path = Path(out_dir) / f"{stem}{suffix}.{ext}"
+        result = save_parquet(df, out_path) if fmt == "parquet" else save_csv(df, out_path)
+
+        if progress_cb:
+            progress_cb(3, 3)
+
+        return result
+    finally:
+        rsa.close()
+
+
 def convert_r3f_to_csv(
     r3f_path: str,
     out_dir: str = "output",
     fspan: float | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> Path:
-    """r3f ファイルを DPX 経由で CSV に変換。
-
-    CSV 列: frequency_hz, time_s, amplitude_dbm
-    """
-    from rsa_api import PlaybackRSA
-
-    rsa = PlaybackRSA()
-    rsa.open_r3f_file(r3f_path)
-    cf = rsa.get_center_freq()
-    sr = rsa.get_sample_rate()
-
-    if fspan is None:
-        fspan = min(sr, 40e6)
-
-    if progress_cb:
-        progress_cb(0, 3)
-
-    dpx_data = rsa.acquire_dpx_data(fspan)
-    trace_len = dpx_data["trace_length"]
-
-    if progress_cb:
-        progress_cb(1, 3)
-
-    hires = rsa.get_dpx_hires_lines(trace_len)
-
-    if progress_cb:
-        progress_cb(2, 3)
-
-    df = dpx_to_dataframe(dpx_data, cf, hires_lines=hires if hires else None)
-
-    stem = Path(r3f_path).stem
-    out_path = Path(out_dir) / f"{stem}.csv"
-    result = save_csv(df, out_path)
-
-    if progress_cb:
-        progress_cb(3, 3)
-
-    return result
+    """r3f → CSV 変換（生 DPX データ）。後方互換用ラッパー。"""
+    return convert_r3f(r3f_path, out_dir, "csv", CONTENT_RAW, fspan, progress_cb)
 
 
 def convert_r3f_to_parquet(
@@ -238,38 +330,5 @@ def convert_r3f_to_parquet(
     fspan: float | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> Path:
-    """r3f ファイルを DPX 経由で Parquet に変換。"""
-    from rsa_api import PlaybackRSA
-
-    rsa = PlaybackRSA()
-    rsa.open_r3f_file(r3f_path)
-    cf = rsa.get_center_freq()
-    sr = rsa.get_sample_rate()
-
-    if fspan is None:
-        fspan = min(sr, 40e6)
-
-    if progress_cb:
-        progress_cb(0, 3)
-
-    dpx_data = rsa.acquire_dpx_data(fspan)
-    trace_len = dpx_data["trace_length"]
-
-    if progress_cb:
-        progress_cb(1, 3)
-
-    hires = rsa.get_dpx_hires_lines(trace_len)
-
-    if progress_cb:
-        progress_cb(2, 3)
-
-    df = dpx_to_dataframe(dpx_data, cf, hires_lines=hires if hires else None)
-
-    stem = Path(r3f_path).stem
-    out_path = Path(out_dir) / f"{stem}.parquet"
-    result = save_parquet(df, out_path)
-
-    if progress_cb:
-        progress_cb(3, 3)
-
-    return result
+    """r3f → Parquet 変換（生 DPX データ）。後方互換用ラッパー。"""
+    return convert_r3f(r3f_path, out_dir, "parquet", CONTENT_RAW, fspan, progress_cb)

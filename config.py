@@ -7,13 +7,25 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 
-ENV_FILE = Path(__file__).parent / ".env"
-ENV_EXAMPLE = Path(__file__).parent / ".env.example"
+def app_dir() -> Path:
+    """設定ファイルを置く基準ディレクトリ。
+
+    PyInstaller で exe 化した場合は exe と同じフォルダ、
+    通常実行時はこのスクリプトのフォルダを返す。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+ENV_FILE = app_dir() / ".env"
+ENV_EXAMPLE = app_dir() / ".env.example"
 
 
 def is_env_configured() -> bool:

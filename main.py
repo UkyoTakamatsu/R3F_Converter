@@ -100,8 +100,9 @@ def main() -> int:
     if args.input is not None:
         return cli_main(args)
 
-    # GUI モード: .env 確認 → なければ初期設定ダイアログ表示
-    if not is_env_configured():
+    # GUI モード: DLL 同梱ビルドなら .env 不要。そうでなければ確認 → 初期設定ダイアログ
+    from rsa_api import IS_BUNDLED
+    if not IS_BUNDLED and not is_env_configured():
         if not show_initial_setup_dialog():
             print("初期設定がキャンセルされました。")
             return 1

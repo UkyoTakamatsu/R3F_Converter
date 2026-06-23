@@ -2,7 +2,7 @@
 PyQt6 GUI module.
 
 Processing flow:
-[Open r3f] -> [Read Metadata] -> [DPX Acquire] -> [Spectrum / Waterfall in dBm] -> [Export CSV]
+[Open r3f] -> [Read Metadata] -> [DPX Acquire] -> [Per-Freq Max / Per-Time Max in dBm] -> [Export CSV]
 """
 
 from __future__ import annotations
@@ -47,23 +47,28 @@ class ConvertWorker(QThread):
         r3f_path: str,
         out_dir: str,
         fmt: str,
+        content: str,
     ) -> None:
         super().__init__()
         self.r3f_path = r3f_path
         self.out_dir  = out_dir
         self.fmt      = fmt
+        self.content  = content
 
     def run(self) -> None:
         try:
-            from converter import convert_r3f_to_csv, convert_r3f_to_parquet
+            from converter import convert_r3f
 
             def cb(done: int, total: int) -> None:
                 self.progress.emit(done, total)
 
-            if self.fmt == "CSV":
-                out = convert_r3f_to_csv(self.r3f_path, self.out_dir, progress_cb=cb)
-            else:
-                out = convert_r3f_to_parquet(self.r3f_path, self.out_dir, progress_cb=cb)
+            out = convert_r3f(
+                self.r3f_path,
+                self.out_dir,
+                fmt=self.fmt,
+                content=self.content,
+                progress_cb=cb,
+            )
             self.finished.emit(str(out))
         except Exception as exc:
             self.error.emit(str(exc))
@@ -78,8 +83,9 @@ class AnalysisWorker(QThread):
         sog_data   : tuple(f, t, sxx)  — f [Hz], t [s], sxx [dBm] (freq×time)
         sample_rate: float [Hz]
         center_freq: float [Hz]
+        start_unix : float  — 最初のタイムスタンプ（測定開始）[Unix 秒]
     """
-    finished = pyqtSignal(object, object, object, object, object)
+    finished = pyqtSignal(object, object, object, object, object, object)
     error    = pyqtSignal(str)
 
     def __init__(self, r3f_path: str) -> None:
@@ -91,15 +97,17 @@ class AnalysisWorker(QThread):
             from rsa_api import PlaybackRSA
 
             rsa = PlaybackRSA()
-            rsa.open_r3f_file(self.r3f_path)
-            cf = rsa.get_center_freq()
-            sr = rsa.get_sample_rate()
+            try:
+                rsa.open_r3f_file(self.r3f_path)
+                cf = rsa.get_center_freq()
+                sr = rsa.get_sample_rate()
 
-            fspan = min(sr, 40e6)
-            dpx_data = rsa.acquire_dpx_data(fspan)
-            trace_len = dpx_data["trace_length"]
-            hires = rsa.get_dpx_hires_lines(trace_len)
-            rsa.close()
+                fspan = min(sr, 40e6)
+                dpx_data = rsa.acquire_dpx_data(fspan)
+                trace_len = dpx_data["trace_length"]
+                hires = rsa.get_dpx_hires_lines(trace_len)
+            finally:
+                rsa.close()
 
             if not hires:
                 self.error.emit("DPX hi-res ラインが取得できませんでした。")
@@ -112,11 +120,13 @@ class AnalysisWorker(QThread):
             psd_dbm = np.max(power_matrix, axis=0)  # 各周波数ごとの最大電力を抜粋
 
             timestamps = np.array([ts for _, ts in hires])
-            timestamps = timestamps - timestamps[0]    # 表示用に 0 正規化
+            start_unix = float(timestamps.min()) if len(timestamps) > 0 else 0.0
+            if len(timestamps) > 0:
+                timestamps = timestamps - timestamps.min()  # 測定開始を 0 に正規化
 
             sxx = power_matrix.T  # (n_freq, n_time)
 
-            self.finished.emit(freqs, psd_dbm, (freqs, timestamps, sxx), sr, cf)
+            self.finished.emit(freqs, psd_dbm, (freqs, timestamps, sxx), sr, cf, start_unix)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -169,6 +179,14 @@ class MainWindow(QMainWindow):
         conv_group = QGroupBox("3. Export Settings")
         cl = QHBoxLayout(conv_group)
 
+        cl.addWidget(QLabel("Data:"))
+        self._content_combo = QComboBox()
+        # (表示名, converter の content 値)
+        self._content_combo.addItem("Raw DPX data", "raw")
+        self._content_combo.addItem("Per-frequency max", "freq_max")
+        self._content_combo.addItem("Per-time max", "time_max")
+        cl.addWidget(self._content_combo)
+
         cl.addWidget(QLabel("Format:"))
         self._fmt_combo = QComboBox()
         self._fmt_combo.addItems(["CSV", "Parquet"])
@@ -191,12 +209,19 @@ class MainWindow(QMainWindow):
         root.addWidget(self._progress)
 
         # ---- Analysis ----
-        plot_group = QGroupBox("4. DPX Analysis (Spectrum / Waterfall)")
+        plot_group = QGroupBox("4. DPX Analysis (Per-Freq Max / Per-Time Max)")
         pl = QVBoxLayout(plot_group)
 
+        btn_row = QHBoxLayout()
         btn_analyze = QPushButton("Acquire DPX & Analyze")
         btn_analyze.clicked.connect(self._on_analyze)
-        pl.addWidget(btn_analyze)
+        btn_row.addWidget(btn_analyze)
+
+        self._btn_save_img = QPushButton("Save Graph Image...")
+        self._btn_save_img.clicked.connect(self._on_save_image)
+        self._btn_save_img.setEnabled(False)
+        btn_row.addWidget(self._btn_save_img)
+        pl.addLayout(btn_row)
 
         self._figure = Figure(figsize=(9, 4.5))
         self._canvas = FigureCanvas(self._figure)
@@ -230,10 +255,12 @@ class MainWindow(QMainWindow):
         try:
             from rsa_api import PlaybackRSA
             rsa = PlaybackRSA()
-            rsa.open_r3f_file(self._r3f_path)
-            cf = rsa.get_center_freq()
-            sr = rsa.get_sample_rate()
-            rsa.close()
+            try:
+                rsa.open_r3f_file(self._r3f_path)
+                cf = rsa.get_center_freq()
+                sr = rsa.get_sample_rate()
+            finally:
+                rsa.close()
             self._lbl_cf.setText(f"Center Freq: {cf / 1e6:.3f} MHz")
             self._lbl_sr.setText(f"Sample Rate: {sr / 1e6:.3f} MSps")
             self.statusBar().showMessage("Metadata loaded.")
@@ -252,6 +279,7 @@ class MainWindow(QMainWindow):
             self._r3f_path,
             self._outdir_label.text(),
             self._fmt_combo.currentText(),
+            self._content_combo.currentData(),
         )
         self._worker.progress.connect(
             lambda d, t: self._progress.setValue(int(d / t * 100) if t else 0)
@@ -286,25 +314,46 @@ class MainWindow(QMainWindow):
         spectrogram_data: tuple,
         sample_rate: float,
         center_freq: float,
+        start_unix: float = 0.0,
     ) -> None:
         f, t, sxx = spectrogram_data
         cf_mhz = center_freq / 1e6
         sr_mhz = sample_rate / 1e6
 
+        # 最初のタイムスタンプ（Unix 秒）を日本標準時 (JST, UTC+9) に変換
+        start_str = "-"
+        if start_unix and start_unix > 0:
+            from datetime import datetime, timezone, timedelta
+            jst = timezone(timedelta(hours=9))
+            start_str = datetime.fromtimestamp(start_unix, tz=jst).strftime(
+                "%Y-%m-%d %H:%M:%S JST"
+            )
+
         rf_freqs_mhz = freqs / 1e6
-        rf_f_mhz     = f / 1e6
+        t_ms         = t * 1e3
+
+        # sxx は (n_freq, n_time) = (周波数点数 ≈801, タイムスタンプ数)。
+        #   左: 各周波数の全時間にわたる最大値 → 周波数軸の折れ線
+        #   右: 各タイムスタンプの全周波数点(≈801点)にわたる最大値 → 時間軸の点列
+        if sxx.ndim == 2 and sxx.shape[1] > 0:
+            freq_max_dbm = np.max(sxx, axis=1)   # (n_freq,)
+            time_max_dbm = np.max(sxx, axis=0)   # (n_time,)
+        else:
+            freq_max_dbm = psd_dbm
+            time_max_dbm = np.array([float(np.max(psd_dbm))])
 
         self._figure.clear()
         self._figure.suptitle(
+            f"Start: {start_str}\n"
             f"Center Freq: {cf_mhz:.3f} MHz   Sample Rate: {sr_mhz:.1f} MSps   [DPX]",
             fontsize=10,
         )
 
-        # ---- DPX Spectrum (dBm) ----
+        # ---- 左: 周波数ごとの最大電力 ----
         ax1 = self._figure.add_subplot(1, 2, 1)
-        ax1.plot(rf_freqs_mhz, psd_dbm, linewidth=0.8, color="steelblue")
+        ax1.plot(rf_freqs_mhz, freq_max_dbm, linewidth=0.8, color="steelblue")
         ax1.fill_between(
-            rf_freqs_mhz, psd_dbm.min() - 5, psd_dbm,
+            rf_freqs_mhz, freq_max_dbm.min() - 5, freq_max_dbm,
             alpha=0.2, color="steelblue",
         )
 
@@ -312,15 +361,15 @@ class MainWindow(QMainWindow):
         try:
             from scipy.signal import find_peaks
             peaks, props = find_peaks(
-                psd_dbm,
+                freq_max_dbm,
                 prominence=6,
-                distance=max(1, len(psd_dbm) // 80),
+                distance=max(1, len(freq_max_dbm) // 80),
             )
             if len(peaks) > 0:
                 top_n = min(5, len(peaks))
                 top_peaks = peaks[np.argsort(props["prominences"])[-top_n:]]
                 ax1.scatter(
-                    rf_freqs_mhz[top_peaks], psd_dbm[top_peaks],
+                    rf_freqs_mhz[top_peaks], freq_max_dbm[top_peaks],
                     color="red", s=30, zorder=5, marker="^",
                     label=f"Peaks ({top_n})",
                 )
@@ -330,29 +379,46 @@ class MainWindow(QMainWindow):
         ax1.axvline(cf_mhz, color="red", linewidth=0.8, linestyle="--",
                     label=f"CF {cf_mhz:.1f} MHz")
         ax1.set_xlabel("Frequency [MHz]")
-        ax1.set_ylabel("Power [dBm]")
-        ax1.set_title("DPX Spectrum")
+        ax1.set_ylabel("Max Power [dBm]")
+        ax1.set_title("Per-Frequency Max")
         ax1.legend(fontsize=8)
         ax1.grid(True, alpha=0.3)
 
-        # ---- Waterfall (dBm) ----
+        # ---- 右: 時間ごとの最大電力 ----
         ax2 = self._figure.add_subplot(1, 2, 2)
-        if sxx.ndim == 2 and sxx.shape[1] > 1:
-            mesh = ax2.pcolormesh(t * 1e3, rf_f_mhz, sxx, shading="auto", cmap="inferno")
-            self._figure.colorbar(mesh, ax=ax2, label="Power [dB]",
-                                  fraction=0.046, pad=0.04)
-        ax2.axhline(cf_mhz, color="cyan", linewidth=0.8, linestyle="--",
-                    label=f"CF {cf_mhz:.1f} MHz")
+        # タイムスタンプ数が多い時はマーカーが潰れるので点サイズを調整
+        marker_size = 4 if len(time_max_dbm) <= 200 else 2
+        ax2.plot(
+            t_ms, time_max_dbm,
+            linewidth=0.8, color="darkorange",
+            marker="o", markersize=marker_size, markerfacecolor="darkorange",
+        )
         ax2.set_xlabel("Time [ms]")
-        ax2.set_ylabel("Frequency [MHz]")
-        ax2.set_title("Waterfall (Spectrogram)")
-        ax2.legend(fontsize=8)
+        ax2.set_ylabel("Max Power [dBm]")
+        ax2.set_title(f"Per-Timestamp Max ({len(time_max_dbm)} pts)")
+        ax2.grid(True, alpha=0.3)
 
         self._figure.tight_layout()
         self._canvas.draw()
+        self._btn_save_img.setEnabled(True)
         self.statusBar().showMessage(
             f"DPX analysis done — CF: {cf_mhz:.3f} MHz  SR: {sr_mhz:.1f} MSps"
         )
+
+    def _on_save_image(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Graph Image",
+            "dpx_analysis.png",
+            "PNG Image (*.png);;PDF (*.pdf);;SVG (*.svg);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            self._figure.savefig(path, dpi=150, bbox_inches="tight")
+            self.statusBar().showMessage(f"Image saved: {path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", str(exc))
 
 
 # ---------------------------------------------------------------------------
