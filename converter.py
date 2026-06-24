@@ -195,18 +195,18 @@ def dpx_time_max_dataframe(
 ) -> pd.DataFrame:
     """各時間ライン（タイムスタンプ）の全周波数にわたる最大電力の表を生成。
 
-    列: time_s, max_amplitude_dbm
+    列: timestamp, max_amplitude_dbm
+
+    timestamp は DPX API が返す生の値（正規化なし、Unix エポック秒）。
     """
     if not hires_lines:
-        return pd.DataFrame({"time_s": [], "max_amplitude_dbm": []})
+        return pd.DataFrame({"timestamp": [], "max_amplitude_dbm": []})
 
     times = np.array([ts for _, ts in hires_lines], dtype=np.float64)
-    if len(times) > 0:
-        times = times - times.min()   # 測定開始を 0 に正規化
     power = np.array([pwr for pwr, _ in hires_lines], dtype=np.float64)  # (n_time, n_freq)
     max_dbm = np.max(power, axis=1)
     return pd.DataFrame({
-        "time_s":            times,
+        "timestamp":         times,
         "max_amplitude_dbm": max_dbm,
     })
 
@@ -232,7 +232,7 @@ def save_parquet(df: pd.DataFrame, out_path: str | Path) -> Path:
 # 出力内容の種類
 CONTENT_RAW      = "raw"        # 生 DPX データ (frequency_hz, timestamp, amplitude_dbm)
 CONTENT_FREQ_MAX = "freq_max"   # 各周波数ごとの最大値 (frequency_hz, max_amplitude_dbm)
-CONTENT_TIME_MAX = "time_max"   # 各時間ごとの最大値   (time_s, max_amplitude_dbm)
+CONTENT_TIME_MAX = "time_max"   # 各時間ごとの最大値   (timestamp, max_amplitude_dbm)
 
 # 内容種別ごとのファイル名サフィックス
 _CONTENT_SUFFIX = {

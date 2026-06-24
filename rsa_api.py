@@ -436,6 +436,11 @@ class PlaybackRSA:
     # 公開 API (Playback 専用) — DPX
     # ------------------------------------------------------------------
 
+    # 従来の測定方法に合わせた固定 RBW [Hz]。
+    # DPX のレベルは RBW フィルタ内電力なので、RBW が違うと全データが
+    # 一律にシフトする（従来法と 2-3 dB ずれる）。従来法と同じ 300 kHz に固定する。
+    DEFAULT_RBW_HZ = 300e3
+
     def acquire_dpx_data(
         self,
         fspan: float,
@@ -465,9 +470,15 @@ class PlaybackRSA:
         self._lib.DPX_GetRBWRange(c_double(fspan), ctypes.byref(min_rbw), ctypes.byref(max_rbw))
 
         if rbw is None:
-            lo = min_rbw.value if min_rbw.value > 0 else 1.0
-            hi = max_rbw.value if max_rbw.value > 0 else fspan
-            rbw = max(lo, min(hi, fspan / 200.0))
+            rbw = self.DEFAULT_RBW_HZ
+
+        # 実機の許容範囲にクランプ（範囲が取得できた場合のみ）
+        lo = min_rbw.value if min_rbw.value > 0 else None
+        hi = max_rbw.value if max_rbw.value > 0 else None
+        if lo is not None:
+            rbw = max(rbw, lo)
+        if hi is not None:
+            rbw = min(rbw, hi)
 
         # DPX_SetParameters (VerticalUnit_dBm = 0)
         status = self._lib.DPX_SetParameters(
