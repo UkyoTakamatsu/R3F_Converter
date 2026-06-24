@@ -386,12 +386,9 @@ class MainWindow(QMainWindow):
 
         # ---- 右: 時間ごとの最大電力 ----
         ax2 = self._figure.add_subplot(1, 2, 2)
-        # タイムスタンプ数が多い時はマーカーが潰れるので点サイズを調整
-        marker_size = 4 if len(time_max_dbm) <= 200 else 2
         ax2.plot(
             t_ms, time_max_dbm,
             linewidth=0.8, color="darkorange",
-            marker="o", markersize=marker_size, markerfacecolor="darkorange",
         )
         ax2.set_xlabel("Time [ms]")
         ax2.set_ylabel("Max Power [dBm]")
