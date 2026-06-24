@@ -119,10 +119,9 @@ class AnalysisWorker(QThread):
             power_matrix = np.array([pwr for pwr, _ in hires], dtype=np.float64)  # (n_time, n_freq)
             psd_dbm = np.max(power_matrix, axis=0)  # 各周波数ごとの最大電力を抜粋
 
+            # 正規化せず DPX API の生タイムスタンプ（Unix エポック秒）をそのまま使う
             timestamps = np.array([ts for _, ts in hires])
             start_unix = float(timestamps.min()) if len(timestamps) > 0 else 0.0
-            if len(timestamps) > 0:
-                timestamps = timestamps - timestamps.min()  # 測定開始を 0 に正規化
 
             sxx = power_matrix.T  # (n_freq, n_time)
 
@@ -330,7 +329,7 @@ class MainWindow(QMainWindow):
             )
 
         rf_freqs_mhz = freqs / 1e6
-        t_ms         = t * 1e3
+        t_s          = t  # 生タイムスタンプ（Unix エポック秒）
 
         # sxx は (n_freq, n_time) = (周波数点数 ≈801, タイムスタンプ数)。
         #   左: 各周波数の全時間にわたる最大値 → 周波数軸の折れ線
@@ -387,10 +386,10 @@ class MainWindow(QMainWindow):
         # ---- 右: 時間ごとの最大電力 ----
         ax2 = self._figure.add_subplot(1, 2, 2)
         ax2.plot(
-            t_ms, time_max_dbm,
+            t_s, time_max_dbm,
             linewidth=0.8, color="darkorange",
         )
-        ax2.set_xlabel("Time [ms]")
+        ax2.set_xlabel("Timestamp [s]")
         ax2.set_ylabel("Max Power [dBm]")
         ax2.set_title(f"Per-Timestamp Max ({len(time_max_dbm)} pts)")
         ax2.grid(True, alpha=0.3)
